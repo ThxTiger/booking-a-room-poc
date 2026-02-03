@@ -48,13 +48,21 @@ def get_rooms():
     token = get_token()
 
     r = requests.get(
-        f"{GRAPH}/places",
-        headers={"Authorization": f"Bearer {token}"},
-        params={"$filter": "microsoft.graph.room"}
+        f"{GRAPH}/places/microsoft.graph.room",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
     )
 
-    r.raise_for_status()
-    return r.json()["value"]
+    if r.status_code != 200:
+        return {
+            "error": r.status_code,
+            "details": r.text
+        }
+
+    return r.json().get("value", [])
+
 
 
 
@@ -79,8 +87,9 @@ def availability(data: dict):
         "availabilityViewInterval": 30
     }
 
+    # Call getSchedule on ANY mailbox (room works fine)
     r = requests.post(
-        f"{GRAPH}/me/calendar/getSchedule",
+        f"{GRAPH}/users/{data['roomEmail']}/calendar/getSchedule",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
@@ -131,4 +140,5 @@ def book_room(data: dict):
 
     r.raise_for_status()
     return r.json()
+
 
