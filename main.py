@@ -1,26 +1,35 @@
+# ==========================================
+# Microsoft 365 Room Booking PoC Backend
+# ==========================================
 import os
 import httpx
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime, timedelta
-from typing import List, Optional
+from datetime import datetime
 from dotenv import load_dotenv
 
-# Load environment variables
+# --- 1. Setup & Configuration ---
 load_dotenv()
 
-app = FastAPI(title="Microsoft 365 Room Booking PoC")
+app = FastAPI(title="Microsoft 365 Room Booking PoC", version="1.0.0")
 
-# --- Configuration ---
-# You must set these in your environment or a .env file
+# Enable CORS for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, replace "*" with your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load credentials from environment variables
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
-# --- Pydantic Models ---
-
+# --- 2. Data Models ---
 class AvailabilityRequest(BaseModel):
     room_email: str
     start_time: datetime
@@ -32,19 +41,15 @@ class BookingRequest(BaseModel):
     room_email: str
     start_time: datetime
     end_time: datetime
-    organizer_email: str  # For the PoC, we might pass this manually or via token
+    organizer_email: str
 
-# --- Helper: Get Microsoft Graph Token ---
+# --- 3. Auth Helper ---
 async def get_graph_token():
-    """
-    Obtains an App-Only Access Token (Client Credentials Flow).
-    Permissions required: Calendars.ReadWrite, Place.Read.All
-    """
+    """Obtains App-Only Access Token from Azure AD."""
     if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
-        raise HTTPException(status_code=500, detail="Missing Azure AD credentials.")
+        raise HTTPException(status_code=500, detail="Missing Azure AD credentials in environment.")
 
     token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    
     data = {
         "client_id": CLIENT_ID,
         "scope": "https://graph.microsoft.com/.default",
@@ -56,40 +61,51 @@ async def get_graph_token():
         response = await client.post(token_url, data=data)
         
     if response.status_code != 200:
-        raise HTTPException(status_code=401, detail=f"Failed to auth with Azure: {response.text}")
+        raise HTTPException(status_code=401, detail=f"Azure Auth Failed: {response.text}")
         
     return response.json().get("access_token")
 
-# --- Endpoints ---
+# --- 4. API Endpoints ---
 
 @app.get("/")
 async def health_check():
-    return {"status": "running", "service": "Room Booking Backend"}
+    return {"status": "online", "service": "Room Booking Backend API"}
 
 @app.get("/rooms")
 async def get_rooms():
     """
-    Fetches all Room resources from the tenant.
-    Graph API: GET /places/microsoft.graph.room
+    Returns a list of available rooms.
+    Currently uses a STATIC list for immediate availability.
+    Uncomment the Graph API code below to switch to dynamic fetching later.
     """
-    token = await get_graph_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    async with httpx.AsyncClient() as client:
-        # Note: 'places' endpoint is stable v1.0 but sometimes requires specific directory setups.
-        # Alternatively use /users if rooms are just user mailboxes, but /places is the correct architectural choice.
-        resp = await client.get(f"{GRAPH_BASE_URL}/places/microsoft.graph.room", headers=headers)
-        
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        
-    return resp.json()
+    # --- STATIC LIST (Temporary fallback) ---
+    static_rooms = [
+        {
+            "displayName": "Conference Room A",
+            "emailAddress": "ConferenceRoomA@AxiansPoc611.onmicrosoft.com"
+        },
+        {
+            "displayName": "Conference Room C",
+            "emailAddress": "ConferenceRoomC@AxiansPoc611.onmicrosoft.com"
+        }
+    ]
+    # Wrapping in a 'value' key to match Graph API response structure
+    return {"value": static_rooms}
+
+    # --- DYNAMIC GRAPH API CALL (Uncomment later) ---
+    # token = await get_graph_token()
+    # headers = {"Authorization": f"Bearer {token}"}
+    # async with httpx.AsyncClient() as client:
+    #     resp = await client.get(f"{GRAPH_BASE_URL}/places/microsoft.graph.room", headers=headers)
+    # if resp.status_code != 200:
+    #     raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    # return resp.json()
+
 
 @app.post("/availability")
 async def check_availability(req: AvailabilityRequest):
     """
-    Checks free/busy status for a specific room.
-    Graph API: POST /users/{id}/calendar/getSchedule
+    Checks free/busy status for a specific room using Microsoft Graph.
     """
     token = await get_graph_token()
     headers = {
@@ -98,56 +114,41 @@ async def check_availability(req: AvailabilityRequest):
         "Prefer": f'outlook.timezone="{req.time_zone}"'
     }
     
-    # Graph expects a list of schedules
     payload = {
         "schedules": [req.room_email],
-        "startTime": {
-            "dateTime": req.start_time.isoformat(),
-            "timeZone": req.time_zone
-        },
-        "endTime": {
-            "dateTime": req.end_time.isoformat(),
-            "timeZone": req.time_zone
-        },
-        "availabilityViewInterval": 15 # 15 minute slots
+        "startTime": {"dateTime": req.start_time.isoformat(), "timeZone": req.time_zone},
+        "endTime": {"dateTime": req.end_time.isoformat(), "timeZone": req.time_zone},
+        "availabilityViewInterval": 15 # Check in 15-minute slots
     }
 
     async with httpx.AsyncClient() as client:
-        # Using the /users/{id} endpoint because rooms are user objects in Exchange
+        # We use the /users endpoint as rooms are technically user objects in Exchange
         url = f"{GRAPH_BASE_URL}/users/{req.room_email}/calendar/getSchedule"
         resp = await client.post(url, headers=headers, json=payload)
 
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        # Pass through Graph API errors for easier debugging
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
         
     return resp.json()
+
 
 @app.post("/book")
 async def create_booking(req: BookingRequest):
     """
-    Creates a meeting in the room's calendar.
-    Graph API: POST /users/{id}/events
+    Creates a meeting event directly in the room's calendar.
     """
     token = await get_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
-    # Basic event structure
     event_payload = {
         "subject": req.subject,
-        "start": {
-            "dateTime": req.start_time.isoformat(),
-            "timeZone": "UTC"
-        },
-        "end": {
-            "dateTime": req.end_time.isoformat(),
-            "timeZone": "UTC"
-        },
+        "start": {"dateTime": req.start_time.isoformat(), "timeZone": "UTC"},
+        "end": {"dateTime": req.end_time.isoformat(), "timeZone": "UTC"},
+        # Add the organizer as an attendee so they get the invite/confirmation
         "attendees": [
             {
-                "emailAddress": {
-                    "address": req.organizer_email,
-                    "name": "Organizer"
-                },
+                "emailAddress": {"address": req.organizer_email},
                 "type": "required"
             }
         ]
@@ -158,6 +159,6 @@ async def create_booking(req: BookingRequest):
         resp = await client.post(url, headers=headers, json=event_payload)
         
     if resp.status_code != 201:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
         
     return {"status": "success", "data": resp.json()}
