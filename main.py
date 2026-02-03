@@ -48,12 +48,14 @@ def get_rooms():
     token = get_token()
 
     r = requests.get(
-        f"{GRAPH}/places/microsoft.graph.room",
-        headers={"Authorization": f"Bearer {token}"}
+        f"{GRAPH}/places",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"$filter": "microsoft.graph.room"}
     )
 
     r.raise_for_status()
     return r.json()["value"]
+
 
 
 # ---------------------------
@@ -129,3 +131,4 @@ def book_room(data: dict):
 
     r.raise_for_status()
     return r.json()
+
