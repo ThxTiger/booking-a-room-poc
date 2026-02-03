@@ -50,18 +50,12 @@ def get_rooms():
     r = requests.get(
         f"{GRAPH}/places/microsoft.graph.room",
         headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Authorization": f"Bearer {token}"
         }
     )
 
-    if r.status_code != 200:
-        return {
-            "error": r.status_code,
-            "details": r.text
-        }
-
-    return r.json().get("value", [])
+    r.raise_for_status()
+    return r.json()["value"]
 
 
 
@@ -140,5 +134,6 @@ def book_room(data: dict):
 
     r.raise_for_status()
     return r.json()
+
 
 
