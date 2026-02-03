@@ -1,6 +1,6 @@
 import os
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -16,13 +16,13 @@ TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
-TOKEN_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 GRAPH = "https://graph.microsoft.com/v1.0"
+TOKEN_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
 
 
-# ---------------------------
-# Microsoft token
-# ---------------------------
+# -------------------------
+# Get Microsoft token
+# -------------------------
 
 def get_token():
     r = requests.post(
@@ -32,16 +32,18 @@ def get_token():
             "client_secret": CLIENT_SECRET,
             "scope": "https://graph.microsoft.com/.default",
             "grant_type": "client_credentials"
-        },
+        }
     )
 
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=r.text)
+
     return r.json()["access_token"]
 
 
-# ---------------------------
-# List rooms
-# ---------------------------
+# -------------------------
+# List rooms (CORRECT)
+# -------------------------
 
 @app.get("/rooms")
 def get_rooms():
@@ -49,20 +51,18 @@ def get_rooms():
 
     r = requests.get(
         f"{GRAPH}/places/microsoft.graph.room",
-        headers={
-            "Authorization": f"Bearer {token}"
-        }
+        headers={"Authorization": f"Bearer {token}"}
     )
 
-    r.raise_for_status()
-    return r.json()["value"]
+    if r.status_code != 200:
+        return {"error": r.status_code, "details": r.text}
+
+    return r.json().get("value", [])
 
 
-
-
-# ---------------------------
-# Room availability timeline
-# ---------------------------
+# -------------------------
+# Room availability
+# -------------------------
 
 @app.post("/availability")
 def availability(data: dict):
@@ -81,7 +81,6 @@ def availability(data: dict):
         "availabilityViewInterval": 30
     }
 
-    # Call getSchedule on ANY mailbox (room works fine)
     r = requests.post(
         f"{GRAPH}/users/{data['roomEmail']}/calendar/getSchedule",
         headers={
@@ -91,49 +90,7 @@ def availability(data: dict):
         json=body
     )
 
-    r.raise_for_status()
+    if r.status_code != 200:
+        return {"error": r.status_code, "details": r.text}
+
     return r.json()
-
-
-# ---------------------------
-# Book room
-# ---------------------------
-
-@app.post("/book")
-def book_room(data: dict):
-    token = get_token()
-
-    meeting = {
-        "subject": "Room Reservation",
-        "start": {
-            "dateTime": data["start"],
-            "timeZone": "UTC"
-        },
-        "end": {
-            "dateTime": data["end"],
-            "timeZone": "UTC"
-        },
-        "attendees": [
-            {
-                "emailAddress": {"address": data["roomEmail"]},
-                "type": "resource"
-            }
-        ],
-        "isOnlineMeeting": True,
-        "onlineMeetingProvider": "teamsForBusiness"
-    }
-
-    r = requests.post(
-        f"{GRAPH}/users/{data['userEmail']}/events",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        },
-        json=meeting
-    )
-
-    r.raise_for_status()
-    return r.json()
-
-
-
