@@ -16,7 +16,7 @@ load_dotenv()
 app = FastAPI(
     title="Microsoft 365 Room Booking PoC", 
     description="Backend for real-time room reservation via Microsoft Graph",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # Enable CORS so your Vercel frontend can talk to this Render backend
@@ -47,6 +47,8 @@ class BookingRequest(BaseModel):
     start_time: datetime
     end_time: datetime
     organizer_email: str
+    # 🆕 NEW: Accept a list of invitee emails
+    attendees: List[str] = [] 
 
 # --- 3. Auth Helper ---
 async def get_graph_token():
@@ -126,7 +128,7 @@ async def check_availability(req: AvailabilityRequest):
 @app.post("/book")
 async def create_booking(req: BookingRequest):
     """
-    Creates a meeting, but ONLY if the room is currently free.
+    Creates a meeting with attendees, but ONLY if the room is currently free.
     Returns 409 Conflict if the room is already reserved.
     """
     token = await get_graph_token()
@@ -156,17 +158,29 @@ async def create_booking(req: BookingRequest):
                     detail="Sorry, this room is already reserved for that time."
                 )
 
-    # --- STEP 2: CREATE THE EVENT ---
+    # --- STEP 2: PREPARE ATTENDEE LIST ---
+    # Always include the Organizer (You)
+    attendee_list = [
+        {
+            "emailAddress": {"address": req.organizer_email},
+            "type": "required"
+        }
+    ]
+
+    # 🆕 Loop through any invitees provided in the request
+    for email in req.attendees:
+        if email.strip():  # Avoid adding empty strings
+            attendee_list.append({
+                "emailAddress": {"address": email.strip()},
+                "type": "required"
+            })
+
+    # --- STEP 3: CREATE THE EVENT ---
     event_payload = {
         "subject": req.subject,
         "start": {"dateTime": req.start_time.isoformat(), "timeZone": "UTC"},
         "end": {"dateTime": req.end_time.isoformat(), "timeZone": "UTC"},
-        "attendees": [
-            {
-                "emailAddress": {"address": req.organizer_email},
-                "type": "required"
-            }
-        ]
+        "attendees": attendee_list  # 🆕 Send the full list to Outlook
     }
 
     async with httpx.AsyncClient() as client:
