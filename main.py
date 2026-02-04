@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Final v10)
+# Microsoft 365 Room Booking Backend (Final v12)
 # ==========================================
 import os
 import httpx
@@ -12,9 +12,8 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from urllib.parse import quote
 
-# --- SETUP ---
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="10.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="12.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +28,6 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
-# --- DATA MODELS ---
 class AvailabilityRequest(BaseModel):
     room_email: str
     start_time: datetime
@@ -50,7 +48,6 @@ class CheckInRequest(BaseModel):
     room_email: str
     event_id: str
 
-# --- AUTH HELPER ---
 async def get_app_token():
     if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
         raise HTTPException(status_code=500, detail="Missing Azure AD credentials.")
@@ -63,7 +60,6 @@ async def get_app_token():
         response = await client.post(token_url, data=data)
     return response.json().get("access_token")
 
-# --- GHOST BUSTER ---
 async def remove_ghost_meetings():
     print("👻 Ghost Buster Service Started...")
     while True:
@@ -94,7 +90,6 @@ async def remove_ghost_meetings():
 async def startup_event():
     asyncio.create_task(remove_ghost_meetings())
 
-# --- ENDPOINTS ---
 @app.get("/rooms")
 async def get_rooms():
     return {"value": [
@@ -130,7 +125,6 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     for email in req.attendees:
         if email.strip(): all_attendees.append({"emailAddress": {"address": email.strip()}, "type": "required"})
     
-    # 🔴 FORCE FORMAT: "Filiale : Description"
     final_subject = f"{req.filiale} : {req.description}" if req.description else f"{req.filiale} : {req.subject}"
     if not final_subject: final_subject = "Meeting"
 
@@ -152,28 +146,23 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
 async def get_active_meeting(room_email: str):
     token = await get_app_token()
     now = datetime.utcnow()
-    # Look 12 hours ahead for NEXT meeting
     start_win = now.isoformat() + "Z"
     end_win = (now + timedelta(hours=12)).isoformat() + "Z"
     
     url = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,categories,start,end,organizer&$orderby=start/dateTime&$top=1"
-    
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
             events = resp.json().get('value', [])
             if events: return events[0]
             
-    # Check if one is currently active (started in past 60 mins)
     past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
     url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
-    
     async with httpx.AsyncClient() as client:
         resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
             events = resp.json().get('value', [])
             if events: return events[0]
-            
     return None
 
 @app.post("/checkin")
@@ -182,3 +171,27 @@ async def check_in_meeting(req: CheckInRequest):
     async with httpx.AsyncClient() as client:
         await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"categories": ["Checked-In"]})
     return {"status": "checked-in"}
+
+# 🔴 NEW ENDPOINT: END MEETING
+@app.post("/end-meeting")
+async def end_meeting(req: CheckInRequest):
+    token = await get_app_token()
+    # Set the meeting End Time to NOW
+    now = datetime.utcnow().isoformat() + "Z"
+    
+    payload = {
+        "end": {
+            "dateTime": now,
+            "timeZone": "UTC"
+        }
+    }
+    
+    url = f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.patch(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=payload)
+        
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
+        
+    return {"status": "ended"}
