@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Final v9)
+# Microsoft 365 Room Booking Backend (Final v10)
 # ==========================================
 import os
 import httpx
@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 # --- SETUP ---
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="9.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="10.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -130,8 +130,7 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     for email in req.attendees:
         if email.strip(): all_attendees.append({"emailAddress": {"address": email.strip()}, "type": "required"})
     
-    # 🔴 FORCE FORMAT: "Filiale - Description"
-    # This prevents the subject from defaulting to the user's name
+    # 🔴 FORCE FORMAT: "Filiale : Description"
     final_subject = f"{req.filiale} : {req.description}" if req.description else f"{req.filiale} : {req.subject}"
     if not final_subject: final_subject = "Meeting"
 
@@ -153,7 +152,7 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
 async def get_active_meeting(room_email: str):
     token = await get_app_token()
     now = datetime.utcnow()
-    # Look 12 hours ahead for the NEXT meeting
+    # Look 12 hours ahead for NEXT meeting
     start_win = now.isoformat() + "Z"
     end_win = (now + timedelta(hours=12)).isoformat() + "Z"
     
@@ -165,7 +164,7 @@ async def get_active_meeting(room_email: str):
             events = resp.json().get('value', [])
             if events: return events[0]
             
-    # If no future meeting, check if one is currently active (started in the past)
+    # Check if one is currently active (started in past 60 mins)
     past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
     url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
     
