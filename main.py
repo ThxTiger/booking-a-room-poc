@@ -9,11 +9,17 @@ from pydantic import BaseModel
 from datetime import datetime
 from typing import List
 from dotenv import load_dotenv
+from urllib.parse import quote  # 🔴 CRITICAL: Used to safely encode dates in URLs
 
+# --- 1. Setup & Configuration ---
 load_dotenv()
 
-app = FastAPI(title="Axians Room Booking", version="1.3.0")
+app = FastAPI(
+    title="Vinci Energies Room Booking API", 
+    version="1.4.0"
+)
 
+# Enable CORS for Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -22,12 +28,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Azure AD Credentials
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
-# --- Data Models ---
+# --- 2. Data Models ---
 class AvailabilityRequest(BaseModel):
     room_email: str
     start_time: datetime
@@ -41,14 +48,14 @@ class BookingRequest(BaseModel):
     end_time: datetime
     organizer_email: str
     attendees: List[str] = []
-    # 🆕 NEW FIELDS
-    description: str = ""   # e.g. "For purchasing team..."
-    filiale: str = ""       # e.g. "Cegelec"
+    description: str = ""   # Meeting reason
+    filiale: str = ""       # Vinci Business Unit
 
-# --- Auth Helper (No Changes) ---
+# --- 3. Auth Helper ---
 async def get_graph_token():
     if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
-        raise HTTPException(status_code=500, detail="Missing Azure credentials.")
+        raise HTTPException(status_code=500, detail="Missing Azure AD credentials.")
+
     token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     data = {
         "client_id": CLIENT_ID,
@@ -56,54 +63,52 @@ async def get_graph_token():
         "client_secret": CLIENT_SECRET,
         "grant_type": "client_credentials",
     }
+
     async with httpx.AsyncClient() as client:
         response = await client.post(token_url, data=data)
+        
     if response.status_code != 200:
-        raise HTTPException(status_code=401, detail=f"Auth Failed: {response.text}")
+        raise HTTPException(status_code=401, detail=f"Azure Auth Failed: {response.text}")
+        
     return response.json().get("access_token")
 
-# --- API Endpoints ---
+# --- 4. API Endpoints ---
 
 @app.get("/rooms")
 async def get_rooms():
-    """
-    Returns rooms with STATIC metadata (Floor, Department).
-    """
+    """Returns static rooms with metadata (Floor, Department) for the frontend."""
     static_rooms = [
         {
             "displayName": "Conference Room A",
             "emailAddress": "ConferenceRoomA@AxiansPoc611.onmicrosoft.com",
-            # 🆕 STATIC DETAILS
             "floor": "Floor 3",
-            "department": "Axians",
-            "capacity": "10 Seats"
+            "department": "Axians"
         },
         {
             "displayName": "Conference Room C",
             "emailAddress": "ConferenceRoomC@AxiansPoc611.onmicrosoft.com",
-            # 🆕 STATIC DETAILS
             "floor": "Floor 4",
-            "department": "QHSE",
-            "capacity": "6 Seats"
+            "department": "QHSE"
         }
     ]
     return {"value": static_rooms}
 
 @app.post("/availability")
 async def check_availability(req: AvailabilityRequest):
-    # (Same as before - no changes needed here)
     token = await get_graph_token()
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Prefer": f'outlook.timezone="{req.time_zone}"'
     }
+    
     payload = {
         "schedules": [req.room_email],
         "startTime": {"dateTime": req.start_time.isoformat(), "timeZone": req.time_zone},
         "endTime": {"dateTime": req.end_time.isoformat(), "timeZone": req.time_zone},
         "availabilityViewInterval": 15
     }
+
     async with httpx.AsyncClient() as client:
         url = f"{GRAPH_BASE_URL}/users/{req.room_email}/calendar/getSchedule"
         resp = await client.post(url, headers=headers, json=payload)
@@ -115,51 +120,57 @@ async def create_booking(req: BookingRequest):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
     # ==================================================================
-    # 🛑 1. THE "HARD" CONFLICT CHECK (CalendarView)
+    # 🛑 STEP 1: ROBUST CONFLICT CHECK (Direct Calendar Query)
     # ==================================================================
-    # We ask for ALL events that overlap with our requested time.
-    # Logic: Existing Start < Request End AND Existing End > Request Start
-    start_str = req.start_time.isoformat()
-    end_str = req.end_time.isoformat()
+    # Use 'Z' to force UTC and 'quote' to make the URL safe.
+    start_dt = req.start_time.replace(tzinfo=None)
+    end_dt = req.end_time.replace(tzinfo=None)
     
-    # URL to search the actual calendar folder
+    start_str = quote(start_dt.isoformat() + "Z")
+    end_str = quote(end_dt.isoformat() + "Z")
+    
     check_url = (
         f"{GRAPH_BASE_URL}/users/{req.room_email}/calendarView"
         f"?startDateTime={start_str}"
         f"&endDateTime={end_str}"
-        f"&$select=subject,start,end"
+        f"&$select=subject"
     )
 
     async with httpx.AsyncClient() as client:
         check_resp = await client.get(check_url, headers=headers)
         
-        if check_resp.status_code == 200:
-            events = check_resp.json().get("value", [])
-            if len(events) > 0:
-                # ⛔ CONFLICT DETECTED
-                existing_subject = events[0].get('subject', 'Unknown Meeting')
-                raise HTTPException(
-                    status_code=409, 
-                    detail=f"Conflict! Room is already booked for: '{existing_subject}'"
-                )
+        # Stop if Microsoft returns an error instead of assuming room is free
+        if check_resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="System Error: Could not verify availability.")
+            
+        events = check_resp.json().get("value", [])
+        
+        # Block booking if any events overlap with the requested time
+        if len(events) > 0:
+            existing_subject = events[0].get('subject', 'Existing Booking')
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Conflict! Room is already booked for: '{existing_subject}'"
+            )
 
     # ==================================================================
-    # 🚀 2. CREATE THE BOOKING (Mark as BUSY)
+    # 🚀 STEP 2: CREATE THE BOOKING
     # ==================================================================
+    # Build attendee list (Organizer + Invitees)
     attendee_list = [{"emailAddress": {"address": req.organizer_email}, "type": "required"}]
     for email in req.attendees:
         if email.strip():
             attendee_list.append({"emailAddress": {"address": email.strip()}, "type": "required"})
 
-    # HTML Body
+    # Dynamic HTML Body for Outlook
     meeting_body = f"""
     <html>
     <body>
-        <h3>Meeting Details</h3>
+        <h3>Meeting Information</h3>
         <p><strong>Filiale:</strong> {req.filiale}</p>
-        <p><strong>Description:</strong> {req.description}</p>
+        <p><strong>Reason:</strong> {req.description}</p>
         <hr/>
-        <p>Booked via Axians Kiosk</p>
+        <p style='color: #888;'>Booked via Axians Room Booking App</p>
     </body>
     </html>
     """
@@ -170,9 +181,9 @@ async def create_booking(req: BookingRequest):
             "contentType": "HTML",
             "content": meeting_body
         },
-        "start": {"dateTime": start_str, "timeZone": "UTC"},
-        "end": {"dateTime": end_str, "timeZone": "UTC"},
-        "showAs": "busy",  # 🔴 CRITICAL: Forces the room to appear 'Busy' immediately
+        "start": {"dateTime": start_dt.isoformat() + "Z", "timeZone": "UTC"},
+        "end": {"dateTime": end_dt.isoformat() + "Z", "timeZone": "UTC"},
+        "showAs": "busy",  # Ensures the slot is blocked immediately
         "attendees": attendee_list
     }
 
@@ -184,37 +195,3 @@ async def create_booking(req: BookingRequest):
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
         
     return {"status": "success", "data": resp.json()}
-
-    # 3. 🆕 Construct Meeting Body (HTML)
-    # This puts the "Reason" and "Filiale" inside the Outlook event description
-    meeting_body = f"""
-    <html>
-    <body>
-        <h3>Meeting Details</h3>
-        <p><strong>Filiale:</strong> {req.filiale}</p>
-        <p><strong>Description:</strong> {req.description}</p>
-        <hr/>
-        <p>Booked via Axians Kiosk</p>
-    </body>
-    </html>
-    """
-
-    event_payload = {
-        "subject": f"{req.subject} ({req.filiale})", # Add Filiale to title too
-        "body": {
-            "contentType": "HTML",
-            "content": meeting_body
-        },
-        "start": {"dateTime": req.start_time.isoformat(), "timeZone": "UTC"},
-        "end": {"dateTime": req.end_time.isoformat(), "timeZone": "UTC"},
-        "attendees": attendee_list
-    }
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{GRAPH_BASE_URL}/users/{req.room_email}/events", headers=headers, json=event_payload)
-        
-    if resp.status_code != 201:
-        raise HTTPException(status_code=resp.status_code, detail=resp.json())
-        
-    return {"status": "success", "data": resp.json()}
-
