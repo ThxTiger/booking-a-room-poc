@@ -114,25 +114,76 @@ async def create_booking(req: BookingRequest):
     token = await get_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
-    # 1. Check Conflicts (Same as before)
-    check_payload = {
-        "schedules": [req.room_email],
-        "startTime": {"dateTime": req.start_time.isoformat(), "timeZone": "UTC"},
-        "endTime": {"dateTime": req.end_time.isoformat(), "timeZone": "UTC"},
-        "availabilityViewInterval": 15
-    }
-    async with httpx.AsyncClient() as client:
-        check_resp = await client.post(f"{GRAPH_BASE_URL}/users/{req.room_email}/calendar/getSchedule", headers=headers, json=check_payload)
-        if check_resp.status_code == 200:
-            view_str = check_resp.json()["value"][0].get("availabilityView", "")
-            if any(char in view_str for char in ["1", "2", "3", "4"]):
-                raise HTTPException(status_code=409, detail="Room is busy.")
+    # ==================================================================
+    # 🛑 1. THE "HARD" CONFLICT CHECK (CalendarView)
+    # ==================================================================
+    # We ask for ALL events that overlap with our requested time.
+    # Logic: Existing Start < Request End AND Existing End > Request Start
+    start_str = req.start_time.isoformat()
+    end_str = req.end_time.isoformat()
+    
+    # URL to search the actual calendar folder
+    check_url = (
+        f"{GRAPH_BASE_URL}/users/{req.room_email}/calendarView"
+        f"?startDateTime={start_str}"
+        f"&endDateTime={end_str}"
+        f"&$select=subject,start,end"
+    )
 
-    # 2. Prepare Attendees
+    async with httpx.AsyncClient() as client:
+        check_resp = await client.get(check_url, headers=headers)
+        
+        if check_resp.status_code == 200:
+            events = check_resp.json().get("value", [])
+            if len(events) > 0:
+                # ⛔ CONFLICT DETECTED
+                existing_subject = events[0].get('subject', 'Unknown Meeting')
+                raise HTTPException(
+                    status_code=409, 
+                    detail=f"Conflict! Room is already booked for: '{existing_subject}'"
+                )
+
+    # ==================================================================
+    # 🚀 2. CREATE THE BOOKING (Mark as BUSY)
+    # ==================================================================
     attendee_list = [{"emailAddress": {"address": req.organizer_email}, "type": "required"}]
     for email in req.attendees:
         if email.strip():
             attendee_list.append({"emailAddress": {"address": email.strip()}, "type": "required"})
+
+    # HTML Body
+    meeting_body = f"""
+    <html>
+    <body>
+        <h3>Meeting Details</h3>
+        <p><strong>Filiale:</strong> {req.filiale}</p>
+        <p><strong>Description:</strong> {req.description}</p>
+        <hr/>
+        <p>Booked via Axians Kiosk</p>
+    </body>
+    </html>
+    """
+
+    event_payload = {
+        "subject": f"{req.subject} ({req.filiale})",
+        "body": {
+            "contentType": "HTML",
+            "content": meeting_body
+        },
+        "start": {"dateTime": start_str, "timeZone": "UTC"},
+        "end": {"dateTime": end_str, "timeZone": "UTC"},
+        "showAs": "busy",  # 🔴 CRITICAL: Forces the room to appear 'Busy' immediately
+        "attendees": attendee_list
+    }
+
+    async with httpx.AsyncClient() as client:
+        url = f"{GRAPH_BASE_URL}/users/{req.room_email}/events"
+        resp = await client.post(url, headers=headers, json=event_payload)
+        
+    if resp.status_code != 201:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+        
+    return {"status": "success", "data": resp.json()}
 
     # 3. 🆕 Construct Meeting Body (HTML)
     # This puts the "Reason" and "Filiale" inside the Outlook event description
@@ -166,3 +217,4 @@ async def create_booking(req: BookingRequest):
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
         
     return {"status": "success", "data": resp.json()}
+
