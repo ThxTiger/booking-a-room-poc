@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Final v6)
+# Microsoft 365 Room Booking Backend (Final Fixed)
 # ==========================================
 import os
 import httpx
@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 # --- SETUP ---
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="6.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="7.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,7 +63,7 @@ async def get_app_token():
         response = await client.post(token_url, data=data)
     return response.json().get("access_token")
 
-# --- GHOST BUSTER (5 Minute Delete Rule) ---
+# --- GHOST BUSTER (Background Task) ---
 async def remove_ghost_meetings():
     print("👻 Ghost Buster Service Started...")
     while True:
@@ -77,7 +77,6 @@ async def remove_ghost_meetings():
             
             for room in rooms['value']:
                 email = room['emailAddress']
-                # Find meetings started 5-20 mins ago
                 url = f"{GRAPH_BASE_URL}/users/{email}/calendarView?startDateTime={twenty_mins_ago}&endDateTime={five_mins_ago}&$select=id,subject,categories"
                 
                 async with httpx.AsyncClient() as client:
@@ -85,7 +84,6 @@ async def remove_ghost_meetings():
                     if resp.status_code == 200:
                         events = resp.json().get('value', [])
                         for event in events:
-                            # If no Green Tag -> Delete
                             if "Checked-In" not in event.get('categories', []):
                                 print(f"❌ DELETING GHOST MEETING: {event['subject']}")
                                 await client.delete(f"{GRAPH_BASE_URL}/users/{email}/events/{event['id']}", headers=headers)
@@ -135,7 +133,8 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     for email in req.attendees:
         if email.strip(): all_attendees.append({"emailAddress": {"address": email.strip()}, "type": "required"})
     
-    # Custom Subject: Filiale : Description
+    # 🔴 FORMATTED TITLE: Filiale : Description
+    # We use ' - ' as separator to parse it easily later if needed
     desc_clean = req.description if req.description else req.subject
     meeting_title = f"{req.filiale} : {desc_clean}"
 
@@ -157,11 +156,12 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
 async def get_active_meeting(room_email: str):
     token = await get_app_token()
     now = datetime.utcnow()
-    # Check 15 mins before/after to find active meeting
+    # 15 min window
     start_win = (now - timedelta(minutes=15)).isoformat() + "Z"
     end_win = (now + timedelta(minutes=15)).isoformat() + "Z"
     
-    url = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,categories,start,end,organizer&$top=1"
+    # We select 'bodyPreview' too so we can display description in the banner if needed
+    url = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,categories,start,end,organizer,bodyPreview&$top=1"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
