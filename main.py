@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Fixed v8)
+# Microsoft 365 Room Booking Backend (Final v9)
 # ==========================================
 import os
 import httpx
@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 # --- SETUP ---
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="8.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="9.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,7 +63,7 @@ async def get_app_token():
         response = await client.post(token_url, data=data)
     return response.json().get("access_token")
 
-# --- GHOST BUSTER (Background Task) ---
+# --- GHOST BUSTER ---
 async def remove_ghost_meetings():
     print("👻 Ghost Buster Service Started...")
     while True:
@@ -71,7 +71,6 @@ async def remove_ghost_meetings():
             token = await get_app_token()
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             now = datetime.utcnow()
-            # Delete if started > 5 mins ago and NOT checked in
             five_mins_ago = (now - timedelta(minutes=5)).isoformat() + "Z"
             twenty_mins_ago = (now - timedelta(minutes=20)).isoformat() + "Z"
             rooms = await get_rooms() 
@@ -79,7 +78,6 @@ async def remove_ghost_meetings():
             for room in rooms['value']:
                 email = room['emailAddress']
                 url = f"{GRAPH_BASE_URL}/users/{email}/calendarView?startDateTime={twenty_mins_ago}&endDateTime={five_mins_ago}&$select=id,subject,categories"
-                
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(url, headers=headers)
                     if resp.status_code == 200:
@@ -119,7 +117,6 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     user_token = authorization.split(" ")[1]
     system_token = await get_app_token()
     
-    # 1. Hard Check (System Token)
     start_str = quote(req.start_time.replace(tzinfo=None).isoformat() + "Z")
     end_str = quote(req.end_time.replace(tzinfo=None).isoformat() + "Z")
     check_url = f"{GRAPH_BASE_URL}/users/{req.room_email}/calendarView?startDateTime={start_str}&endDateTime={end_str}&$select=subject"
@@ -129,16 +126,17 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
         if len(check_resp.json().get("value", [])) > 0:
             raise HTTPException(status_code=409, detail="Conflict! Room is already booked.")
 
-    # 2. Book as User (User Token)
     all_attendees = [{"emailAddress": {"address": req.room_email}, "type": "resource"}]
     for email in req.attendees:
         if email.strip(): all_attendees.append({"emailAddress": {"address": email.strip()}, "type": "required"})
     
-    desc_clean = req.description if req.description else req.subject
-    meeting_title = f"{req.filiale} : {desc_clean}"
+    # 🔴 FORCE FORMAT: "Filiale - Description"
+    # This prevents the subject from defaulting to the user's name
+    final_subject = f"{req.filiale} : {req.description}" if req.description else f"{req.filiale} : {req.subject}"
+    if not final_subject: final_subject = "Meeting"
 
     event_payload = {
-        "subject": meeting_title, 
+        "subject": final_subject, 
         "body": {"contentType": "HTML", "content": f"Filiale: {req.filiale}<br>Reason: {req.description}"},
         "start": {"dateTime": req.start_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
         "end": {"dateTime": req.end_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
@@ -155,12 +153,10 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
 async def get_active_meeting(room_email: str):
     token = await get_app_token()
     now = datetime.utcnow()
-    
-    # 🔴 UPGRADE: Look 12 HOURS ahead to find the *NEXT* meeting
+    # Look 12 hours ahead for the NEXT meeting
     start_win = now.isoformat() + "Z"
     end_win = (now + timedelta(hours=12)).isoformat() + "Z"
     
-    # Sort by start time (ascending) to get the CLOSEST one
     url = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,categories,start,end,organizer&$orderby=start/dateTime&$top=1"
     
     async with httpx.AsyncClient() as client:
@@ -169,8 +165,8 @@ async def get_active_meeting(room_email: str):
             events = resp.json().get('value', [])
             if events: return events[0]
             
-    # If no future meeting, check slightly in the past (active now?)
-    past_start = (now - timedelta(minutes=30)).isoformat() + "Z"
+    # If no future meeting, check if one is currently active (started in the past)
+    past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
     url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
     
     async with httpx.AsyncClient() as client:
