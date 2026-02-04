@@ -10,7 +10,8 @@ from datetime import datetime
 from typing import List, Optional
 from dotenv import load_dotenv
 from urllib.parse import quote
-
+import asyncio
+from fastapi import BackgroundTasks
 # --- 1. Setup & Configuration ---
 load_dotenv()
 
@@ -110,6 +111,125 @@ async def check_availability(req: AvailabilityRequest):
         resp = await client.post(url, headers=headers, json=payload)
     return resp.json()
 
+# ... (Previous imports and setup) ...
+
+# ==========================================
+# 👻 THE GHOST BUSTER (Background Task)
+# ==========================================
+async def remove_ghost_meetings():
+    """
+    Runs continuously. 
+    1. Checks all rooms.
+    2. Finds meetings started > 5 mins ago.
+    3. If NOT 'Checked-In', DELETE them.
+    """
+    while True:
+        try:
+            token = await get_app_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            # Define the "Ghost Window" (Started 5 to 20 mins ago)
+            now = datetime.utcnow()
+            five_mins_ago = (now - timedelta(minutes=5)).isoformat() + "Z"
+            twenty_mins_ago = (now - timedelta(minutes=20)).isoformat() + "Z"
+
+            rooms = await get_rooms() # We reuse your existing get_rooms function
+            
+            for room in rooms['value']:
+                email = room['emailAddress']
+                
+                # Find active meetings in the ghost window
+                url = (
+                    f"{GRAPH_BASE_URL}/users/{email}/calendarView"
+                    f"?startDateTime={twenty_mins_ago}"
+                    f"&endDateTime={five_mins_ago}"
+                    f"&$select=id,subject,categories"
+                )
+                
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        events = resp.json().get('value', [])
+                        for event in events:
+                            # 🔍 CHECK: Does it have the 'Checked-In' tag?
+                            categories = event.get('categories', [])
+                            if "Checked-In" not in categories:
+                                print(f"👻 GHOST BUSTED: Deleting {event['subject']} in {email}")
+                                # DELETE THE MEETING
+                                await client.delete(
+                                    f"{GRAPH_BASE_URL}/users/{email}/events/{event['id']}", 
+                                    headers=headers
+                                )
+                                
+        except Exception as e:
+            print(f"Ghost Buster Error: {e}")
+            
+        # Sleep for 60 seconds before checking again
+        await asyncio.sleep(60)
+
+# Start the Ghost Buster when App starts
+@app.on_event("startup")
+async def startup_event():
+    # Run in background
+    asyncio.create_task(remove_ghost_meetings())
+
+
+# ==========================================
+# ✅ NEW ENDPOINT: CHECK-IN
+# ==========================================
+class CheckInRequest(BaseModel):
+    room_email: str
+    event_id: str
+
+@app.post("/checkin")
+async def check_in_meeting(req: CheckInRequest):
+    token = await get_app_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
+    # We PATCH the event to add the "Checked-In" category
+    payload = {
+        "categories": ["Checked-In"]
+    }
+    
+    url = f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.patch(url, headers=headers, json=payload)
+        
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Check-in failed")
+        
+    return {"status": "checked-in", "msg": "You have successfully confirmed your attendance."}
+
+# ==========================================
+# 🔍 NEW ENDPOINT: GET CURRENT ACTIVE MEETING
+# ==========================================
+@app.get("/active-meeting")
+async def get_active_meeting(room_email: str):
+    """Finds the meeting happening RIGHT NOW so we can show the Check-In button."""
+    token = await get_app_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
+    now = datetime.utcnow()
+    # Check a tight window (Now +/- 1 minute)
+    start_window = (now - timedelta(minutes=15)).isoformat() + "Z" # Can check in 15 mins late max
+    end_window = (now + timedelta(minutes=15)).isoformat() + "Z"   # Can check in 15 mins early
+    
+    url = (
+        f"{GRAPH_BASE_URL}/users/{room_email}/calendarView"
+        f"?startDateTime={start_window}"
+        f"&endDateTime={end_window}"
+        f"&$select=id,subject,categories,start,end,organizer"
+        f"&$top=1"
+    )
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code == 200:
+            events = resp.json().get('value', [])
+            if events:
+                return events[0] # Return the active event
+    return None # No meeting right now
 @app.post("/book")
 async def create_booking(req: BookingRequest, authorization: Optional[str] = Header(None)):
     """
@@ -208,3 +328,4 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
         raise HTTPException(status_code=resp.status_code, detail=f"User Booking Failed: {resp.text}")
         
     return {"status": "success", "data": resp.json()}
+
