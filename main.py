@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Final v12)
+# Microsoft 365 Room Booking Backend (Final v13)
 # ==========================================
 import os
 import httpx
@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from urllib.parse import quote
 
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="12.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="13.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,18 +146,22 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
 async def get_active_meeting(room_email: str):
     token = await get_app_token()
     now = datetime.utcnow()
+    # Look 12 hours ahead
     start_win = now.isoformat() + "Z"
     end_win = (now + timedelta(hours=12)).isoformat() + "Z"
     
-    url = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,categories,start,end,organizer&$orderby=start/dateTime&$top=1"
+    # 🔴 FIX: ADDED 'bodyPreview' TO SELECT LIST
+    url = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime&$top=1"
+    
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
             events = resp.json().get('value', [])
             if events: return events[0]
             
+    # Check slightly past
     past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
-    url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
+    url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200:
@@ -172,26 +176,13 @@ async def check_in_meeting(req: CheckInRequest):
         await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"categories": ["Checked-In"]})
     return {"status": "checked-in"}
 
-# 🔴 NEW ENDPOINT: END MEETING
 @app.post("/end-meeting")
 async def end_meeting(req: CheckInRequest):
     token = await get_app_token()
-    # Set the meeting End Time to NOW
     now = datetime.utcnow().isoformat() + "Z"
-    
-    payload = {
-        "end": {
-            "dateTime": now,
-            "timeZone": "UTC"
-        }
-    }
-    
+    payload = { "end": { "dateTime": now, "timeZone": "UTC" } }
     url = f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
-    
     async with httpx.AsyncClient() as client:
         resp = await client.patch(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=payload)
-        
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
-        
+    if resp.status_code != 200: raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     return {"status": "ended"}
