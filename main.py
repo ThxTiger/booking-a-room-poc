@@ -119,7 +119,7 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     user_token = authorization.split(" ")[1]
     system_token = await get_app_token()
     
-    # 1. Hard Check (System Token)
+    # ... (Keep the Hard Conflict Check logic exactly as it is) ...
     start_str = quote(req.start_time.replace(tzinfo=None).isoformat() + "Z")
     end_str = quote(req.end_time.replace(tzinfo=None).isoformat() + "Z")
     check_url = f"{GRAPH_BASE_URL}/users/{req.room_email}/calendarView?startDateTime={start_str}&endDateTime={end_str}&$select=subject"
@@ -134,9 +134,20 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     for email in req.attendees:
         if email.strip(): all_attendees.append({"emailAddress": {"address": email.strip()}, "type": "required"})
     
+    # 🔴 NEW: CUSTOM SUBJECT FORMATTING
+    # If a Description is provided, use "Filiale - Description". 
+    # Otherwise, fall back to "Filiale - Subject".
+    if req.description and len(req.description) < 50: # Use description if short enough
+        meeting_title = f"{req.filiale} : {req.description}"
+    else:
+        meeting_title = f"{req.filiale} : {req.subject}"
+
     event_payload = {
-        "subject": f"{req.subject} ({req.filiale})",
-        "body": {"contentType": "HTML", "content": f"Filiale: {req.filiale}<br>Reason: {req.description}"},
+        "subject": meeting_title, # ⬅️ THIS updates the Banner Title
+        "body": {
+            "contentType": "HTML", 
+            "content": f"<b>Filiale:</b> {req.filiale}<br><b>Reason:</b> {req.description}"
+        },
         "start": {"dateTime": req.start_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
         "end": {"dateTime": req.end_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
         "location": {"displayName": "Conference Room", "locationEmailAddress": req.room_email},
@@ -171,3 +182,4 @@ async def check_in_meeting(req: CheckInRequest):
     async with httpx.AsyncClient() as client:
         await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"categories": ["Checked-In"]})
     return {"status": "checked-in"}
+
