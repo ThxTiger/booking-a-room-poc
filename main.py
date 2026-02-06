@@ -11,6 +11,9 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from dotenv import load_dotenv
 from urllib.parse import quote
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 
 load_dotenv()
 app = FastAPI(title="Vinci Energies Room Booking API", version="13.0.0")
@@ -85,7 +88,17 @@ async def remove_ghost_meetings():
         except Exception as e:
             print(f"⚠️ Ghost Buster Error: {e}")
         await asyncio.sleep(60)
+security = HTTPBearer()
 
+def verify_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    if not token:
+         raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+        )
+    # (Optional: Add advanced signature verification code here later)
+    return token
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(remove_ghost_meetings())
@@ -143,7 +156,7 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     return {"status": "success", "data": resp.json()}
 
 @app.get("/active-meeting")
-async def get_active_meeting(room_email: str):
+async def get_active_meeting(room_email: str, user_token: str = Depends(verify_user)):
     token = await get_app_token()
     now = datetime.utcnow()
     # Look 12 hours ahead
@@ -186,3 +199,4 @@ async def end_meeting(req: CheckInRequest):
         resp = await client.patch(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=payload)
     if resp.status_code != 200: raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     return {"status": "ended"}
+
