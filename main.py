@@ -1,22 +1,20 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Final v13)
+# Microsoft 365 Room Booking Backend (Final v14 - Kiosk Privacy)
 # ==========================================
 import os
 import httpx
 import asyncio
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import List, Optional
 from dotenv import load_dotenv
 from urllib.parse import quote
-from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="13.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="14.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +29,7 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
+# --- MODELS ---
 class AvailabilityRequest(BaseModel):
     room_email: str
     start_time: datetime
@@ -51,6 +50,34 @@ class CheckInRequest(BaseModel):
     room_email: str
     event_id: str
 
+# --- AUTH HELPERS ---
+security = HTTPBearer()
+
+# 1. STRICT VERIFICATION (For Booking/Check-in)
+def verify_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    if not token:
+         raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+        )
+    return token
+
+# 2. 🆕 OPTIONAL VERIFICATION (For Passive Display/Kiosk)
+async def optional_verify_user(authorization: Optional[str] = Header(None)):
+    """
+    Checks for a token but returns None if missing (instead of crashing).
+    Allows 'Kiosk Mode' to work.
+    """
+    if not authorization:
+        return None
+    
+    parts = authorization.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+# --- GRAPH HELPER ---
 async def get_app_token():
     if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
         raise HTTPException(status_code=500, detail="Missing Azure AD credentials.")
@@ -63,6 +90,7 @@ async def get_app_token():
         response = await client.post(token_url, data=data)
     return response.json().get("access_token")
 
+# --- BACKGROUND SERVICE ---
 async def remove_ghost_meetings():
     print("👻 Ghost Buster Service Started...")
     while True:
@@ -88,20 +116,12 @@ async def remove_ghost_meetings():
         except Exception as e:
             print(f"⚠️ Ghost Buster Error: {e}")
         await asyncio.sleep(60)
-security = HTTPBearer()
 
-def verify_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    if not token:
-         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-        )
-    # (Optional: Add advanced signature verification code here later)
-    return token
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(remove_ghost_meetings())
+
+# --- ROUTES ---
 
 @app.get("/rooms")
 async def get_rooms():
@@ -155,32 +175,52 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     if resp.status_code != 201: raise HTTPException(status_code=resp.status_code, detail=f"Booking Failed: {resp.text}")
     return {"status": "success", "data": resp.json()}
 
+# --- 🆕 UPDATED: ACTIVE MEETING WITH PRIVACY FILTER ---
 @app.get("/active-meeting")
-async def get_active_meeting(room_email: str, user_token: str = Depends(verify_user)):
+async def get_active_meeting(
+    room_email: str, 
+    user_token: Optional[str] = Depends(optional_verify_user) # <--- ALLOWS ANONYMOUS ACCESS
+):
     token = await get_app_token()
     now = datetime.utcnow()
-    # Look 12 hours ahead
+    
+    # 1. FETCH MEETING (Logic consolidated)
+    found_event = None
+    
+    # Try Future (Look ahead 12 hours)
     start_win = now.isoformat() + "Z"
     end_win = (now + timedelta(hours=12)).isoformat() + "Z"
-    
-    # 🔴 FIX: ADDED 'bodyPreview' TO SELECT LIST
-    url = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime&$top=1"
+    url_future = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime&$top=1"
     
     async with httpx.AsyncClient() as client:
-        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-        if resp.status_code == 200:
-            events = resp.json().get('value', [])
-            if events: return events[0]
-            
-    # Check slightly past
-    past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
-    url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
-        if resp.status_code == 200:
-            events = resp.json().get('value', [])
-            if events: return events[0]
-    return None
+        resp = await client.get(url_future, headers={"Authorization": f"Bearer {token}"})
+        if resp.status_code == 200 and resp.json().get('value'):
+            found_event = resp.json().get('value')[0]
+    
+    # If no future meeting, check Past (Active Now but started earlier)
+    if not found_event:
+        past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
+        url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
+            if resp.status_code == 200 and resp.json().get('value'):
+                found_event = resp.json().get('value')[0]
+
+    # 2. IF NO MEETING, RETURN NONE
+    if not found_event:
+        return None
+
+    # 3. 🔒 PRIVACY FILTER (SERVER-SIDE SANITIZATION) 🔒
+    # If the user is NOT logged in (user_token is None), HIDE the secrets.
+    if not user_token:
+        # print(f"🔒 Masking data for {room_email} (Kiosk Mode)")
+        found_event["subject"] = "Busy"
+        found_event["bodyPreview"] = "Details hidden for privacy."
+        if "organizer" in found_event:
+            found_event["organizer"]["emailAddress"]["name"] = "Occupied"
+            found_event["organizer"]["emailAddress"]["address"] = ""
+    
+    return found_event
 
 @app.post("/checkin")
 async def check_in_meeting(req: CheckInRequest):
@@ -199,4 +239,3 @@ async def end_meeting(req: CheckInRequest):
         resp = await client.patch(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=payload)
     if resp.status_code != 200: raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     return {"status": "ended"}
-
