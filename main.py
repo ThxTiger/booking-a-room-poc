@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Final v14 - Kiosk Privacy)
+# Microsoft 365 Room Booking Backend (Final v15 - Secure Check-In)
 # ==========================================
 import os
 import httpx
@@ -14,7 +14,7 @@ from urllib.parse import quote
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="14.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="15.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -175,7 +175,7 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     if resp.status_code != 201: raise HTTPException(status_code=resp.status_code, detail=f"Booking Failed: {resp.text}")
     return {"status": "success", "data": resp.json()}
 
-# --- 🆕 UPDATED: ACTIVE MEETING WITH PRIVACY FILTER ---
+# --- 🆕 UPDATED: ACTIVE MEETING WITH ATTENDEES & PRIVACY ---
 @app.get("/active-meeting")
 async def get_active_meeting(
     room_email: str, 
@@ -190,7 +190,9 @@ async def get_active_meeting(
     # Try Future (Look ahead 12 hours)
     start_win = now.isoformat() + "Z"
     end_win = (now + timedelta(hours=12)).isoformat() + "Z"
-    url_future = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime&$top=1"
+    
+    # 🛠️ UPDATE: ADDED 'attendees' TO SELECT LIST
+    url_future = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime&$top=1"
     
     async with httpx.AsyncClient() as client:
         resp = await client.get(url_future, headers={"Authorization": f"Bearer {token}"})
@@ -200,7 +202,8 @@ async def get_active_meeting(
     # If no future meeting, check Past (Active Now but started earlier)
     if not found_event:
         past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
-        url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer&$orderby=start/dateTime desc&$top=1"
+        # 🛠️ UPDATE: ADDED 'attendees' TO SELECT LIST
+        url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime desc&$top=1"
         async with httpx.AsyncClient() as client:
             resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
             if resp.status_code == 200 and resp.json().get('value'):
@@ -216,14 +219,24 @@ async def get_active_meeting(
         # print(f"🔒 Masking data for {room_email} (Kiosk Mode)")
         found_event["subject"] = "Busy"
         found_event["bodyPreview"] = "Details hidden for privacy."
+        
+        # Hide Organizer
         if "organizer" in found_event:
             found_event["organizer"]["emailAddress"]["name"] = "Occupied"
             found_event["organizer"]["emailAddress"]["address"] = ""
+        
+        # Hide Attendees list so hackers can't see who is invited
+        if "attendees" in found_event:
+             found_event["attendees"] = []
     
     return found_event
 
+# 🔒 SECURE CHECK-IN: Now requires 'verify_user' (Strict Mode)
 @app.post("/checkin")
-async def check_in_meeting(req: CheckInRequest):
+async def check_in_meeting(
+    req: CheckInRequest, 
+    user_token: str = Depends(verify_user) # <--- THIS ENFORCES AUTH
+):
     token = await get_app_token()
     async with httpx.AsyncClient() as client:
         await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"categories": ["Checked-In"]})
