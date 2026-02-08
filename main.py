@@ -242,13 +242,24 @@ async def check_in_meeting(
         await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"categories": ["Checked-In"]})
     return {"status": "checked-in"}
 
+# 🔒 SECURE END MEETING: Now requires 'verify_user'
 @app.post("/end-meeting")
-async def end_meeting(req: CheckInRequest):
+async def end_meeting(
+    req: CheckInRequest,
+    user_token: str = Depends(verify_user) # <--- ADD THIS SECURITY GUARD
+):
     token = await get_app_token()
     now = datetime.utcnow().isoformat() + "Z"
+    
+    # ... (rest of function is the same) ...
     payload = { "end": { "dateTime": now, "timeZone": "UTC" } }
     url = f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
+    
     async with httpx.AsyncClient() as client:
         resp = await client.patch(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=payload)
-    if resp.status_code != 200: raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
+    
+    if resp.status_code != 200: 
+        raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
+    
     return {"status": "ended"}
+
