@@ -122,7 +122,25 @@ async def startup_event():
     asyncio.create_task(remove_ghost_meetings())
 
 # --- ROUTES ---
+class ExtendRequest(BaseModel):
+    room_email: str
+    event_id: str
+    extend_minutes: int = 15
 
+@app.post("/extend-meeting")
+async def extend_meeting(req: ExtendRequest):
+    token = await get_app_token()
+    now = datetime.utcnow()
+    new_end = (now + timedelta(minutes=req.extend_minutes)).isoformat() + "Z"
+    # fetch current end first, then add to it
+    async with httpx.AsyncClient() as client:
+        ev = await client.get(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}?$select=end", headers={"Authorization": f"Bearer {token}"})
+        current_end = datetime.fromisoformat(ev.json()["end"]["dateTime"].replace("Z",""))
+        new_end_dt = current_end + timedelta(minutes=req.extend_minutes)
+        resp = await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"end": {"dateTime": new_end_dt.isoformat() + "Z", "timeZone": "UTC"}})
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Failed to extend")
+    return {"status": "extended", "new_end": new_end_dt.isoformat()}
 @app.get("/rooms")
 async def get_rooms():
     return {"value": [
@@ -262,4 +280,5 @@ async def end_meeting(
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     
     return {"status": "ended"}
+
 
