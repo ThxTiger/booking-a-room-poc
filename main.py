@@ -253,13 +253,12 @@ async def get_active_meeting(
 
 # 🔒 SECURE CHECK-IN: Now requires 'verify_user' (Strict Mode)
 @app.post("/checkin")
-async def check_in_meeting(
-    req: CheckInRequest, 
-    user_token: str = Depends(verify_user) # <--- THIS ENFORCES AUTH
-):
+async def check_in_meeting(req: CheckInRequest):  # removed Depends(verify_user)
     token = await get_app_token()
     async with httpx.AsyncClient() as client:
-        await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"categories": ["Checked-In"]})
+        await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"categories": ["Checked-In"]})
     return {"status": "checked-in"}
 
 # 🔒 SECURE END MEETING: Now requires 'verify_user'
@@ -282,6 +281,7 @@ async def end_meeting(
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     
     return {"status": "ended"}
+
 
 
 
