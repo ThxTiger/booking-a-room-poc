@@ -196,60 +196,34 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     return {"status": "success", "data": resp.json()}
 
 # --- 🆕 UPDATED: ACTIVE MEETING WITH ATTENDEES & PRIVACY ---
+# NEW — no auth param, no masking, return everything directly
 @app.get("/active-meeting")
-async def get_active_meeting(
-    room_email: str, 
-    user_token: Optional[str] = Depends(optional_verify_user) # <--- ALLOWS ANONYMOUS ACCESS
-):
+async def get_active_meeting(room_email: str):
     token = await get_app_token()
     now = datetime.utcnow()
-    
-    # 1. FETCH MEETING (Logic consolidated)
     found_event = None
-    
-    # Try Future (Look ahead 12 hours)
+
     start_win = now.isoformat() + "Z"
     end_win = (now + timedelta(hours=12)).isoformat() + "Z"
-    
-    # 🛠️ UPDATE: ADDED 'attendees' TO SELECT LIST
     url_future = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime&$top=1"
-    
+
     async with httpx.AsyncClient() as client:
         resp = await client.get(url_future, headers={"Authorization": f"Bearer {token}"})
         if resp.status_code == 200 and resp.json().get('value'):
             found_event = resp.json().get('value')[0]
-    
-    # If no future meeting, check Past (Active Now but started earlier)
+
     if not found_event:
         past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
-        # 🛠️ UPDATE: ADDED 'attendees' TO SELECT LIST
         url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime desc&$top=1"
         async with httpx.AsyncClient() as client:
             resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
             if resp.status_code == 200 and resp.json().get('value'):
                 found_event = resp.json().get('value')[0]
 
-    # 2. IF NO MEETING, RETURN NONE
     if not found_event:
         return None
 
-    # 3. 🔒 PRIVACY FILTER (SERVER-SIDE SANITIZATION) 🔒
-    # If the user is NOT logged in (user_token is None), HIDE the secrets.
-    if not user_token:
-        # print(f"🔒 Masking data for {room_email} (Kiosk Mode)")
-        found_event["subject"] = "Busy"
-        found_event["bodyPreview"] = "Details hidden for privacy."
-        
-        # Hide Organizer
-        if "organizer" in found_event:
-            found_event["organizer"]["emailAddress"]["name"] = "Occupied"
-            found_event["organizer"]["emailAddress"]["address"] = ""
-        
-        # Hide Attendees list so hackers can't see who is invited
-        if "attendees" in found_event:
-             found_event["attendees"] = []
-    
-    return found_event
+    return found_event  # no masking — full data always visible
 
 # 🔒 SECURE CHECK-IN: Now requires 'verify_user' (Strict Mode)
 @app.post("/checkin")
@@ -281,6 +255,7 @@ async def end_meeting(
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     
     return {"status": "ended"}
+
 
 
 
