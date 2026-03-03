@@ -1,33 +1,42 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend (Final v15 - Secure Check-In)
+# Microsoft 365 Room Booking Backend (Final v16 - BFF & Secure Cookies)
 # ==========================================
 import os
 import httpx
 import asyncio
-from fastapi import FastAPI, HTTPException, Header, Depends, status
+import secrets
+import urllib.parse
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import List, Optional
 from dotenv import load_dotenv
-from urllib.parse import quote
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 load_dotenv()
-app = FastAPI(title="Vinci Energies Room Booking API", version="15.0.0")
+app = FastAPI(title="Vinci Energies Room Booking API", version="16.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# --- CONFIGURATION ---
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+
+# Hardcoded for now, can be moved to .env later:
+# FRONTEND_URL = os.getenv("FRONTEND_URL")
+# BACKEND_URL = os.getenv("BACKEND_URL")
+FRONTEND_URL = "https://booking-frontend-three-flax.vercel.app"
+BACKEND_URL = "https://booking-a-room-poc.onrender.com"
+
+# CORS must have explicit origins when allow_credentials=True
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_URL, "http://localhost:5500", "http://127.0.0.1:5500"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- MODELS ---
 class AvailabilityRequest(BaseModel):
@@ -50,32 +59,123 @@ class CheckInRequest(BaseModel):
     room_email: str
     event_id: str
 
-# --- AUTH HELPERS ---
-security = HTTPBearer()
+class ExtendRequest(BaseModel):
+    room_email: str
+    event_id: str
+    extend_minutes: int = 15
 
-# 1. STRICT VERIFICATION (For Booking/Check-in)
-def verify_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    if not token:
-         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-        )
-    return token
+# --- SESSION MANAGEMENT (BFF / HttpOnly Cookies) ---
+COOKIE_NAME = "room_session"
+_sessions: dict = {}   # { sid -> { access_token, username, expires_at } }
 
-# 2. 🆕 OPTIONAL VERIFICATION (For Passive Display/Kiosk)
-async def optional_verify_user(authorization: Optional[str] = Header(None)):
-    """
-    Checks for a token but returns None if missing (instead of crashing).
-    Allows 'Kiosk Mode' to work.
-    """
-    if not authorization:
+def _get_session(request: Request):
+    sid = request.cookies.get(COOKIE_NAME)
+    if not sid: return None
+    sess = _sessions.get(sid)
+    if not sess: return None
+    if datetime.utcnow() > sess["expires_at"]:
+        _sessions.pop(sid, None)
         return None
+    return sess
+
+def _require_session(request: Request):
+    sess = _get_session(request)
+    if not sess: 
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    return sess
+
+def _create_session(token: str, username: str, expires_in: int = 3600):
+    sid = secrets.token_urlsafe(32)
+    _sessions[sid] = {
+        "access_token": token, 
+        "username": username,
+        "expires_at": datetime.utcnow() + timedelta(seconds=expires_in)
+    }
+    return sid
+
+# --- AUTH ROUTES ---
+@app.get("/auth/login")
+async def auth_login():
+    state = secrets.token_urlsafe(16)
+    _sessions[f"_state_{state}"] = {"ts": datetime.utcnow()}
+    params = urllib.parse.urlencode({
+        "client_id": CLIENT_ID, 
+        "response_type": "code",
+        "redirect_uri": f"{BACKEND_URL}/auth/callback",
+        "response_mode": "query",
+        "scope": "openid profile User.Read Calendars.ReadWrite",
+        "state": state, 
+        "prompt": "select_account",
+    })
+    return RedirectResponse(f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize?{params}")
+
+@app.get("/auth/callback")
+async def auth_callback(code: str = None, state: str = None, error: str = None, error_description: str = None):
+    if error: 
+        return RedirectResponse(f"{FRONTEND_URL}?auth_error={urllib.parse.quote(error_description or error)}")
+    if not code: 
+        return RedirectResponse(f"{FRONTEND_URL}?auth_error=no_code")
+    if f"_state_{state}" not in _sessions: 
+        return RedirectResponse(f"{FRONTEND_URL}?auth_error=invalid_state")
     
-    parts = authorization.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
-    return None
+    _sessions.pop(f"_state_{state}")
+    
+    async with httpx.AsyncClient() as c:
+        tr = await c.post(
+            f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token",
+            data={
+                "client_id": CLIENT_ID, 
+                "client_secret": CLIENT_SECRET, 
+                "code": code,
+                "redirect_uri": f"{BACKEND_URL}/auth/callback", 
+                "grant_type": "authorization_code",
+                "scope": "openid profile User.Read Calendars.ReadWrite"
+            }
+        )
+    
+    td = tr.json()
+    token = td.get("access_token")
+    exp = int(td.get("expires_in", 3600))
+    
+    if not token: 
+        return RedirectResponse(f"{FRONTEND_URL}?auth_error=token_exchange_failed")
+    
+    async with httpx.AsyncClient() as c:
+        me = await c.get(
+            f"{GRAPH_BASE_URL}/me?$select=userPrincipalName,mail",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+    
+    me_data = me.json()
+    username = me_data.get("userPrincipalName") or me_data.get("mail") or "unknown"
+    sid = _create_session(token, username, exp)
+    
+    resp = RedirectResponse(url=f"{FRONTEND_URL}?auth=success", status_code=302)
+    resp.set_cookie(
+        key=COOKIE_NAME, 
+        value=sid, 
+        httponly=True, 
+        secure=True,
+        samesite="none", # Required for cross-site cookie sending
+        max_age=exp, 
+        path="/"
+    )
+    return resp
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    sess = _get_session(request)
+    if not sess: 
+        raise HTTPException(401, "No active session")
+    return {"authenticated": True, "username": sess["username"]}
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request, response: Response):
+    sid = request.cookies.get(COOKIE_NAME)
+    if sid: 
+        _sessions.pop(sid, None)
+    response.delete_cookie(COOKIE_NAME, path="/", samesite="none", secure=True)
+    return {"status": "logged_out"}
 
 # --- GRAPH HELPER ---
 async def get_app_token():
@@ -100,9 +200,11 @@ async def remove_ghost_meetings():
             now = datetime.utcnow()
             five_mins_ago = (now - timedelta(minutes=5)).isoformat() + "Z"
             twenty_mins_ago = (now - timedelta(minutes=20)).isoformat() + "Z"
-            rooms = await get_rooms() 
             
-            for room in rooms['value']:
+            # Fetch rooms logic to iterate
+            rooms_resp = await get_rooms() 
+            
+            for room in rooms_resp['value']:
                 email = room['emailAddress']
                 url = f"{GRAPH_BASE_URL}/users/{email}/calendarView?startDateTime={twenty_mins_ago}&endDateTime={five_mins_ago}&$select=id,subject,categories"
                 async with httpx.AsyncClient() as client:
@@ -122,25 +224,25 @@ async def startup_event():
     asyncio.create_task(remove_ghost_meetings())
 
 # --- ROUTES ---
-class ExtendRequest(BaseModel):
-    room_email: str
-    event_id: str
-    extend_minutes: int = 15
-
 @app.post("/extend-meeting")
 async def extend_meeting(req: ExtendRequest):
     token = await get_app_token()
     now = datetime.utcnow()
     new_end = (now + timedelta(minutes=req.extend_minutes)).isoformat() + "Z"
-    # fetch current end first, then add to it
+    
     async with httpx.AsyncClient() as client:
         ev = await client.get(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}?$select=end", headers={"Authorization": f"Bearer {token}"})
         current_end = datetime.fromisoformat(ev.json()["end"]["dateTime"].replace("Z",""))
         new_end_dt = current_end + timedelta(minutes=req.extend_minutes)
-        resp = await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"end": {"dateTime": new_end_dt.isoformat() + "Z", "timeZone": "UTC"}})
+        resp = await client.patch(
+            f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}", 
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, 
+            json={"end": {"dateTime": new_end_dt.isoformat() + "Z", "timeZone": "UTC"}}
+        )
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to extend")
     return {"status": "extended", "new_end": new_end_dt.isoformat()}
+
 @app.get("/rooms")
 async def get_rooms():
     return {"value": [
@@ -159,14 +261,51 @@ async def check_availability(req: AvailabilityRequest):
         resp = await client.post(f"{GRAPH_BASE_URL}/users/{req.room_email}/calendar/getSchedule", headers=headers, json=payload)
     return resp.json()
 
+@app.get("/active-meeting")
+async def get_active_meeting(room_email: str):
+    token = await get_app_token()
+    now = datetime.utcnow()
+    found_event = None
+
+    start_win = now.isoformat() + "Z"
+    end_win = (now + timedelta(hours=12)).isoformat() + "Z"
+    url_future = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime&$top=1"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url_future, headers={"Authorization": f"Bearer {token}"})
+        if resp.status_code == 200 and resp.json().get('value'):
+            found_event = resp.json().get('value')[0]
+
+    if not found_event:
+        past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
+        url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime desc&$top=1"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
+            if resp.status_code == 200 and resp.json().get('value'):
+                found_event = resp.json().get('value')[0]
+
+    return found_event 
+
+@app.post("/checkin")
+async def check_in_meeting(req: CheckInRequest):  
+    token = await get_app_token()
+    async with httpx.AsyncClient() as client:
+        await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"categories": ["Checked-In"]})
+    return {"status": "checked-in"}
+
+# 🔒 SECURE BOOKING: Now requires the HttpOnly Cookie session
 @app.post("/book")
-async def create_booking(req: BookingRequest, authorization: Optional[str] = Header(None)):
-    if not authorization: raise HTTPException(status_code=401, detail="Missing User Token")
-    user_token = authorization.split(" ")[1]
+async def create_booking(req: BookingRequest, request: Request):
+    # This automatically blocks requests without a valid cookie
+    sess = _require_session(request)
+    user_token = sess["access_token"]
+    username = sess["username"]
     system_token = await get_app_token()
     
-    start_str = quote(req.start_time.replace(tzinfo=None).isoformat() + "Z")
-    end_str = quote(req.end_time.replace(tzinfo=None).isoformat() + "Z")
+    start_str = urllib.parse.quote(req.start_time.replace(tzinfo=None).isoformat() + "Z")
+    end_str = urllib.parse.quote(req.end_time.replace(tzinfo=None).isoformat() + "Z")
     check_url = f"{GRAPH_BASE_URL}/users/{req.room_email}/calendarView?startDateTime={start_str}&endDateTime={end_str}&$select=subject"
     
     async with httpx.AsyncClient() as client:
@@ -191,60 +330,25 @@ async def create_booking(req: BookingRequest, authorization: Optional[str] = Hea
     }
 
     async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{GRAPH_BASE_URL}/me/events", headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}, json=event_payload)
-    if resp.status_code != 201: raise HTTPException(status_code=resp.status_code, detail=f"Booking Failed: {resp.text}")
+        # Use the delegated user token from the secure session cookie
+        resp = await client.post(
+            f"{GRAPH_BASE_URL}/me/events", 
+            headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}, 
+            json=event_payload
+        )
+    if resp.status_code != 201: 
+        raise HTTPException(status_code=resp.status_code, detail=f"Booking Failed: {resp.text}")
     return {"status": "success", "data": resp.json()}
 
-# --- 🆕 UPDATED: ACTIVE MEETING WITH ATTENDEES & PRIVACY ---
-# NEW — no auth param, no masking, return everything directly
-@app.get("/active-meeting")
-async def get_active_meeting(room_email: str):
-    token = await get_app_token()
-    now = datetime.utcnow()
-    found_event = None
-
-    start_win = now.isoformat() + "Z"
-    end_win = (now + timedelta(hours=12)).isoformat() + "Z"
-    url_future = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={start_win}&endDateTime={end_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime&$top=1"
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url_future, headers={"Authorization": f"Bearer {token}"})
-        if resp.status_code == 200 and resp.json().get('value'):
-            found_event = resp.json().get('value')[0]
-
-    if not found_event:
-        past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
-        url_past = f"{GRAPH_BASE_URL}/users/{room_email}/calendarView?startDateTime={past_start}&endDateTime={start_win}&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees&$orderby=start/dateTime desc&$top=1"
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
-            if resp.status_code == 200 and resp.json().get('value'):
-                found_event = resp.json().get('value')[0]
-
-    if not found_event:
-        return None
-
-    return found_event  # no masking — full data always visible
-
-# 🔒 SECURE CHECK-IN: Now requires 'verify_user' (Strict Mode)
-@app.post("/checkin")
-async def check_in_meeting(req: CheckInRequest):  # removed Depends(verify_user)
-    token = await get_app_token()
-    async with httpx.AsyncClient() as client:
-        await client.patch(f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"categories": ["Checked-In"]})
-    return {"status": "checked-in"}
-
-# 🔒 SECURE END MEETING: Now requires 'verify_user'
+# 🔒 SECURE END MEETING: Now requires the HttpOnly Cookie session
 @app.post("/end-meeting")
-async def end_meeting(
-    req: CheckInRequest,
-    user_token: str = Depends(verify_user) # <--- ADD THIS SECURITY GUARD
-):
+async def end_meeting(req: CheckInRequest, request: Request):
+    # Protect route using the cookie
+    sess = _require_session(request)
+    
     token = await get_app_token()
     now = datetime.utcnow().isoformat() + "Z"
     
-    # ... (rest of function is the same) ...
     payload = { "end": { "dateTime": now, "timeZone": "UTC" } }
     url = f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
     
@@ -255,8 +359,3 @@ async def end_meeting(
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     
     return {"status": "ended"}
-
-
-
-
-
