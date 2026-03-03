@@ -144,8 +144,10 @@ async def extend_meeting(req: ExtendRequest):
 @app.get("/rooms")
 async def get_rooms():
     return {"value": [
-        {"displayName": "Conference Room A", "emailAddress": "ConferenceRoomA@AxiansPoc611.onmicrosoft.com", "floor": "Floor 3", "department": "Axians"},
-        {"displayName": "Conference Room C", "emailAddress": "ConferenceRoomC@AxiansPoc611.onmicrosoft.com", "floor": "Floor 4", "department": "QHSE"}
+        {"displayName": "Conference Room A", "emailAddress": "ConferenceRoomA@AxiansPoc611.onmicrosoft.com",
+         "floor": "Floor 3", "department": "Axians", "capacity": 8, "location": "Casablanca HQ"},
+        {"displayName": "Conference Room C", "emailAddress": "ConferenceRoomC@AxiansPoc611.onmicrosoft.com",
+         "floor": "Floor 4", "department": "QHSE", "capacity": 8, "location": "Casablanca HQ"}
     ]}
 
 @app.post("/availability")
@@ -280,5 +282,6 @@ async def end_meeting(
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     
     return {"status": "ended"}
+
 
 
