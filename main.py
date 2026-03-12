@@ -5,7 +5,7 @@
 import os
 import httpx
 import asyncio
-from fastapi import FastAPI, HTTPException, Header, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -68,13 +68,6 @@ def verify_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
     return token
 
-async def optional_verify_user(authorization: Optional[str] = Header(None)):
-    if not authorization:
-        return None
-    parts = authorization.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
-    return None
 
 # --- GRAPH HELPERS ---
 async def get_app_token():
@@ -355,3 +348,4 @@ async def end_meeting(
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     return {"status": "ended"}
+
