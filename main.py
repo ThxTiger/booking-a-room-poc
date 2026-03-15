@@ -85,6 +85,12 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 # FIX-05: single timeout constant used everywhere
 HTTPX_TIMEOUT = 10.0
 
+def _timeout_error():
+    raise HTTPException(
+        status_code=504,
+        detail="External service timeout. Please try again."
+    )
+
 
 # ─── MODELS ───────────────────────────────────────────────────
 # FIX-04: Field constraints on every user-controlled input
@@ -136,18 +142,24 @@ async def get_app_token():
         "client_secret": CLIENT_SECRET,
         "grant_type"   : "client_credentials",
     }
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        response = await client.post(token_url, data=data)
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            response = await client.post(token_url, data=data)
+    except httpx.TimeoutException:
+        _timeout_error()
     return response.json().get("access_token")
 
 
 # FIX-02 (v16): verify token against Graph /me — rejects fake tokens
 async def verify_token_and_get_email(user_token: str) -> str:
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        me_resp = await client.get(
-            f"{GRAPH_BASE_URL}/me?$select=userPrincipalName",
-            headers={"Authorization": f"Bearer {user_token}"}
-        )
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            me_resp = await client.get(
+                f"{GRAPH_BASE_URL}/me?$select=userPrincipalName",
+                headers={"Authorization": f"Bearer {user_token}"}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
     if me_resp.status_code != 200:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -233,11 +245,14 @@ async def check_availability(request: Request, req: AvailabilityRequest):
         "endTime"                 : {"dateTime": req.end_time.isoformat(),   "timeZone": req.time_zone},
         "availabilityViewInterval": 15
     }
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        resp = await client.post(
-            f"{GRAPH_BASE_URL}/users/{req.room_email}/calendar/getSchedule",
-            headers=headers, json=payload
-        )
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            resp = await client.post(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/calendar/getSchedule",
+                headers=headers, json=payload
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
     return resp.json()
 
 
@@ -282,12 +297,15 @@ async def get_active_meeting(request: Request, room_email: str):
 async def check_in_meeting(req: CheckInRequest):
     # No auth — physical kiosk presence is the authorization
     token = await get_app_token()
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        resp = await client.patch(
-            f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"categories": ["Checked-In"]}
-        )
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            resp = await client.patch(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"categories": ["Checked-In"]}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
     # FIX-09: structured errors instead of 500
     if resp.status_code == 404:
         raise HTTPException(status_code=404, detail="Event not found.")
@@ -343,10 +361,13 @@ async def create_booking(
         f"{GRAPH_BASE_URL}/users/{req.room_email}/calendarView"
         f"?startDateTime={start_str}&endDateTime={end_str}&$select=subject"
     )
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        check_resp = await client.get(check_url, headers={"Authorization": f"Bearer {system_token}"})
-        if len(check_resp.json().get("value", [])) > 0:
-            raise HTTPException(status_code=409, detail="Conflict! Room is already booked.")
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            check_resp = await client.get(check_url, headers={"Authorization": f"Bearer {system_token}"})
+    except httpx.TimeoutException:
+        _timeout_error()
+    if len(check_resp.json().get("value", [])) > 0:
+        raise HTTPException(status_code=409, detail="Conflict! Room is already booked.")
 
     all_attendees = [{"emailAddress": {"address": req.room_email}, "type": "resource"}]
     for email in req.attendees:
@@ -366,12 +387,15 @@ async def create_booking(
         "attendees": all_attendees
     }
 
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        resp = await client.post(
-            f"{GRAPH_BASE_URL}/me/events",
-            headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
-            json=event_payload
-        )
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            resp = await client.post(
+                f"{GRAPH_BASE_URL}/me/events",
+                headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
+                json=event_payload
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
     if resp.status_code != 201:
         raise HTTPException(status_code=resp.status_code, detail=f"Booking Failed: {resp.text}")
     return {"status": "success", "data": resp.json()}
@@ -390,12 +414,15 @@ async def end_meeting(
 
     # Step 2: fetch event fresh from Graph — never trust the client's allowed list
     app_token = await get_app_token()
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        ev = await client.get(
-            f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
-            f"?$select=organizer,attendees",
-            headers={"Authorization": f"Bearer {app_token}"}
-        )
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            ev = await client.get(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
+                f"?$select=organizer,attendees",
+                headers={"Authorization": f"Bearer {app_token}"}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
     # FIX-09: structured errors
     if ev.status_code == 404:
         raise HTTPException(status_code=404, detail="Event not found.")
@@ -419,12 +446,15 @@ async def end_meeting(
 
     # Step 4: end the meeting
     now = datetime.utcnow().isoformat() + "Z"
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        resp = await client.patch(
-            f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
-            headers={"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"},
-            json={"end": {"dateTime": now, "timeZone": "UTC"}}
-        )
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+            resp = await client.patch(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
+                headers={"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"},
+                json={"end": {"dateTime": now, "timeZone": "UTC"}}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
     return {"status": "ended"}
