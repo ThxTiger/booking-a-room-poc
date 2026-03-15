@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend v17
+# Microsoft 365 Room Booking Backend v18
 # Security fixes applied:
 #   FIX-01 (v16): CORS locked
 #   FIX-02 (v16): Token verified via Graph /me
@@ -10,6 +10,8 @@
 #   FIX-07 (v17): Security response-headers middleware
 #   FIX-08 (v17): Structured logging (no meeting subjects)
 #   FIX-09 (v17): Proper 404/422 instead of 500
+#   FIX-10 (v18): Rate limit added to /rooms, /checkin, /extend-meeting
+#   FIX-11 (v18): Query param length validation on GET /active-meeting
 # ==========================================
 import os
 import logging
@@ -212,7 +214,8 @@ async def startup_event():
 # ─── ROUTES ───────────────────────────────────────────────────
 
 @app.get("/rooms")
-async def get_rooms():
+@limiter.limit("60/minute")
+async def get_rooms(request: Request):
     return {"value": [
         {
             "displayName" : "Conference Room A",
@@ -260,6 +263,9 @@ async def check_availability(request: Request, req: AvailabilityRequest):
 @app.get("/active-meeting")
 @limiter.limit("60/minute")
 async def get_active_meeting(request: Request, room_email: str):
+    # FIX-04: validate query param length (Pydantic Field only applies to body models)
+    if not room_email or len(room_email) > 200:
+        raise HTTPException(status_code=422, detail="Invalid room_email.")
     token       = await get_app_token()
     now         = datetime.utcnow()
     found_event = None
@@ -294,7 +300,8 @@ async def get_active_meeting(request: Request, room_email: str):
 
 
 @app.post("/checkin")
-async def check_in_meeting(req: CheckInRequest):
+@limiter.limit("30/minute")
+async def check_in_meeting(request: Request, req: CheckInRequest):
     # No auth — physical kiosk presence is the authorization
     token = await get_app_token()
     try:
@@ -315,7 +322,8 @@ async def check_in_meeting(req: CheckInRequest):
 
 
 @app.post("/extend-meeting")
-async def extend_meeting(req: ExtendRequest):
+@limiter.limit("30/minute")
+async def extend_meeting(request: Request, req: ExtendRequest):
     # No auth — physical kiosk presence is the authorization
     token = await get_app_token()
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
