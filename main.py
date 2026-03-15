@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend v18
+# Microsoft 365 Room Booking Backend v19
 # Security fixes applied:
 #   FIX-01 (v16): CORS locked
 #   FIX-02 (v16): Token verified via Graph /me
@@ -12,6 +12,7 @@
 #   FIX-09 (v17): Proper 404/422 instead of 500
 #   FIX-10 (v18): Rate limit added to /rooms, /checkin, /extend-meeting
 #   FIX-11 (v18): Query param length validation on GET /active-meeting
+#   FIX-12 (v19): Added CSP, COEP, COOP, CORP headers to middleware
 # ==========================================
 import os
 import logging
@@ -61,11 +62,15 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["X-Content-Type-Options"]    = "nosniff"
-        response.headers["X-Frame-Options"]           = "DENY"
-        response.headers["Referrer-Policy"]           = "no-referrer"
-        response.headers["Permissions-Policy"]        = "camera=(), microphone=(), geolocation=()"
+        response.headers["Strict-Transport-Security"]    = "max-age=31536000; includeSubDomains"
+        response.headers["X-Content-Type-Options"]       = "nosniff"
+        response.headers["X-Frame-Options"]              = "DENY"
+        response.headers["Referrer-Policy"]              = "no-referrer"
+        response.headers["Permissions-Policy"]           = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"]      = "default-src 'none'"
+        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+        response.headers["Cross-Origin-Opener-Policy"]   = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         return response
 
 app.add_middleware(SecurityHeadersMiddleware)
