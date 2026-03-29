@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend v20
+# Microsoft 365 Room Booking Backend v21
 # Security fixes applied:
 #   FIX-01 (v16): CORS locked
 #   FIX-02 (v16): Token verified via Graph /me
@@ -13,10 +13,15 @@
 #   FIX-10 (v18): Rate limit added to /rooms, /checkin, /extend-meeting
 #   FIX-11 (v18): Query param length validation on GET /active-meeting
 #   FIX-12 (v19): Added CSP, COEP, COOP, CORP headers to middleware
-#   FIX-13 (v20): /active-meeting returns up to 5 upcoming events (was $top=1)
-#                 so multiple booked meetings all appear in the kiosk UI
+#   FIX-13 (v20): /active-meeting returns up to 5 upcoming events
+#   FIX-14 (v21): App token cached (1 hour) — no longer fetched per request
+#   FIX-15 (v21): Email + event_id format validated before Graph URL injection
+#   FIX-16 (v21): /checkin enforces 5-min window + already-checked-in guard
+#   FIX-17 (v21): /extend-meeting enforces active + checked-in + server-side conflict check
+#   FIX-18 (v21): Plain text body with \r\n so bodyPreview is parseable on kiosk
 # ==========================================
 import os
+import re
 import logging
 import httpx
 import asyncio
@@ -37,6 +42,7 @@ from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
+# ─── LOGGING ──────────────────────────────────────────────────
 # FIX-08: structured logging — never log meeting content
 logging.basicConfig(
     level=logging.INFO,
@@ -44,23 +50,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("room-booking")
 
+# ─── APP ──────────────────────────────────────────────────────
 # FIX-06: disable docs/schema when ENV=production
 _is_prod = os.getenv("ENV") == "production"
 
 app = FastAPI(
     title="Vinci Energies Room Booking API",
-    version="20.0.0",
+    version="21.0.0",
     docs_url    = None if _is_prod else "/docs",
     redoc_url   = None if _is_prod else "/redoc",
     openapi_url = None if _is_prod else "/openapi.json",
 )
 
-# FIX-03: attach limiter
+# FIX-03: attach rate limiter
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# FIX-07: security response headers added to every reply
+# ─── SECURITY HEADERS ─────────────────────────────────────────
+# FIX-07 + FIX-12: security + isolation headers on every response
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
@@ -77,7 +85,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# FIX-01 (v16): CORS locked to frontend domain only
+# FIX-01: CORS locked to frontend domain only
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://booking-frontend-three-flax.vercel.app"],
@@ -86,20 +94,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── CONFIG ───────────────────────────────────────────────────
 TENANT_ID      = os.getenv("TENANT_ID")
 CLIENT_ID      = os.getenv("CLIENT_ID")
 CLIENT_SECRET  = os.getenv("CLIENT_SECRET")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+HTTPX_TIMEOUT  = 10.0  # FIX-05: single timeout constant used everywhere
 
-# FIX-05: single timeout constant used everywhere
-HTTPX_TIMEOUT = 10.0
+# ─── FIX-15: INPUT FORMAT VALIDATORS ─────────────────────────
+# Validate before injecting into Graph API URLs — prevents path traversal
+EMAIL_RE    = re.compile(r'^[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}$')
+EVENTID_RE  = re.compile(r'^[A-Za-z0-9\-_=+/]+$')  # Graph IDs are base64-like
 
-def _timeout_error():
-    raise HTTPException(
-        status_code=504,
-        detail="External service timeout. Please try again."
-    )
+def validate_email(v: str, label: str = "email"):
+    if not v or not EMAIL_RE.match(v):
+        raise HTTPException(status_code=422, detail=f"Invalid {label} format.")
 
+def validate_event_id(v: str):
+    if not v or not EVENTID_RE.match(v):
+        raise HTTPException(status_code=422, detail="Invalid event ID format.")
 
 # ─── MODELS ───────────────────────────────────────────────────
 # FIX-04: Field constraints on every user-controlled input
@@ -127,8 +140,7 @@ class CheckInRequest(BaseModel):
 class ExtendRequest(BaseModel):
     room_email     : str = Field(..., max_length=200)
     event_id       : str = Field(..., max_length=500)
-    extend_minutes : int = Field(15, ge=1, le=120)   # 1 to 120 minutes only
-
+    extend_minutes : int = Field(15, ge=1, le=120)
 
 # ─── AUTH ─────────────────────────────────────────────────────
 security = HTTPBearer()
@@ -139,11 +151,22 @@ def verify_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
     return token
 
+def _timeout_error():
+    raise HTTPException(status_code=504, detail="External service timeout. Please try again.")
 
-# ─── GRAPH HELPERS ────────────────────────────────────────────
-async def get_app_token():
+# ─── FIX-14: TOKEN CACHE ──────────────────────────────────────
+# Was: fresh HTTP round-trip to Microsoft on EVERY request (~300ms overhead)
+# Now: cached for 59 minutes, single token fetch per hour per process
+_token_cache: dict = {"token": None, "expires_at": datetime.min}
+
+async def get_app_token() -> str:
+    global _token_cache
+    if _token_cache["token"] and datetime.utcnow() < _token_cache["expires_at"]:
+        return _token_cache["token"]
+
     if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
         raise HTTPException(status_code=500, detail="Missing Azure AD credentials.")
+
     token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     data = {
         "client_id"    : CLIENT_ID,
@@ -156,10 +179,19 @@ async def get_app_token():
             response = await client.post(token_url, data=data)
     except httpx.TimeoutException:
         _timeout_error()
-    return response.json().get("access_token")
 
+    result = response.json()
+    if "access_token" not in result:
+        raise HTTPException(status_code=500, detail="Failed to obtain app token.")
 
-# FIX-02 (v16): verify token against Graph /me — rejects fake tokens
+    _token_cache = {
+        "token"     : result["access_token"],
+        "expires_at": datetime.utcnow() + timedelta(seconds=result.get("expires_in", 3600) - 60)
+    }
+    logger.info("App token refreshed. Expires in ~%ds", result.get("expires_in", 3600) - 60)
+    return _token_cache["token"]
+
+# FIX-02: verify token against Graph /me — rejects fake/expired tokens
 async def verify_token_and_get_email(user_token: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
@@ -176,8 +208,8 @@ async def verify_token_and_get_email(user_token: str) -> str:
         )
     return me_resp.json().get("userPrincipalName", "").lower()
 
-
 # ─── GHOST BUSTER ─────────────────────────────────────────────
+# Removes meetings that were booked but never checked in within 5 minutes
 async def remove_ghost_meetings():
     logger.info("Ghost Buster started.")
     while True:
@@ -217,7 +249,6 @@ async def remove_ghost_meetings():
 async def startup_event():
     asyncio.create_task(remove_ghost_meetings())
 
-
 # ─── ROUTES ───────────────────────────────────────────────────
 
 @app.get("/rooms")
@@ -246,6 +277,9 @@ async def get_rooms(request: Request = None):
 @app.post("/availability")
 @limiter.limit("30/minute")
 async def check_availability(request: Request, req: AvailabilityRequest):
+    # FIX-15: validate email before injecting into URL
+    validate_email(req.room_email, "room_email")
+
     token   = await get_app_token()
     headers = {
         "Authorization": f"Bearer {token}",
@@ -270,35 +304,20 @@ async def check_availability(request: Request, req: AvailabilityRequest):
 
 
 # ─── ACTIVE MEETING ───────────────────────────────────────────
-# FIX-13 (v20): Now returns a LIST of up to 5 upcoming events
-# (was $top=1 which caused only the first booked meeting to appear).
-#
-# Response shape:
-#   - If a meeting is currently active (now >= start && now < end):
-#       returns that single event object (dict) — unchanged behaviour,
-#       the frontend handles this as before for check-in / red screen.
-#   - If no active meeting but upcoming meetings exist:
-#       returns a LIST of up to 5 future events so the kiosk can show
-#       all of them (primary countdown card + secondary cards below it).
-#   - If nothing found at all:
-#       returns null (None).
-#
-# The frontend must handle both dict and list responses:
-#   const raw   = await res.json();
-#   const events = Array.isArray(raw) ? raw : (raw ? [raw] : []);
-#   const event  = events[0] ?? null;
-# ─────────────────────────────────────────────────────────────
+# FIX-13: returns up to 5 upcoming events so kiosk shows all booked meetings
 @app.get("/active-meeting")
 @limiter.limit("60/minute")
 async def get_active_meeting(request: Request, room_email: str):
     # FIX-11: validate query param length
     if not room_email or len(room_email) > 200:
         raise HTTPException(status_code=422, detail="Invalid room_email.")
+    # FIX-15: validate format
+    validate_email(room_email, "room_email")
 
     token = await get_app_token()
     now   = datetime.utcnow()
 
-    # ── 1. Check for a currently active meeting (started in the past, not yet ended) ──
+    # 1. Check for a currently active meeting (started in the past, not yet ended)
     past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
     now_str    = now.isoformat() + "Z"
 
@@ -317,25 +336,19 @@ async def get_active_meeting(request: Request, room_email: str):
     if resp.status_code == 200:
         active_events = resp.json().get("value", [])
         if active_events:
-            event      = active_events[0]
-            event_end  = datetime.fromisoformat(
-                event["end"]["dateTime"].replace("Z", "")
-            )
-            # Only return as "active" if the meeting hasn't ended yet
+            event     = active_events[0]
+            event_end = datetime.fromisoformat(event["end"]["dateTime"].replace("Z", ""))
             if event_end > now:
-                # Single dict — frontend treats this as the currently running meeting
-                return event
+                return event  # Single dict — currently running meeting
 
-    # ── 2. No active meeting — fetch up to 5 UPCOMING events ──
-    # FIX-13: was $top=1, now $top=5 so all booked meetings are returned
+    # 2. No active meeting — fetch up to 5 upcoming events
     future_end = (now + timedelta(hours=12)).isoformat() + "Z"
-
     url_future = (
         f"{GRAPH_BASE_URL}/users/{room_email}/calendarView"
         f"?startDateTime={now_str}&endDateTime={future_end}"
         f"&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees"
         f"&$orderby=start/dateTime"
-        f"&$top=5"   # ← was $top=1 — now returns all upcoming meetings
+        f"&$top=5"
     )
     try:
         async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
@@ -346,64 +359,181 @@ async def get_active_meeting(request: Request, room_email: str):
     if resp.status_code == 200:
         upcoming = resp.json().get("value", [])
         if upcoming:
-            # Return the full list so the frontend can render all upcoming cards
-            return upcoming   # LIST — frontend checks Array.isArray()
+            return upcoming  # LIST — frontend checks Array.isArray()
 
-    # ── 3. Nothing found ──
     return None
 
 
+# ─── CHECKIN ──────────────────────────────────────────────────
+# FIX-16: enforces 5-min window + already-checked-in guard
+# Was: blindly patched any event at any time with no validation
 @app.post("/checkin")
 @limiter.limit("30/minute")
 async def check_in_meeting(request: Request, req: CheckInRequest):
-    # No auth — physical kiosk presence is the authorization
+    # FIX-15: format validation before Graph URL injection
+    validate_email(req.room_email, "room_email")
+    validate_event_id(req.event_id)
+
     token = await get_app_token()
+
+    # Step 1: Fetch event fresh from Graph — never trust client-supplied state
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
+            ev = await client.get(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
+                f"?$select=start,end,categories",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
+
+    if ev.status_code == 404:
+        raise HTTPException(status_code=404, detail="Event not found.")
+    if ev.status_code != 200:
+        raise HTTPException(status_code=422, detail="Could not retrieve event.")
+
+    ev_data = ev.json()
+    now     = datetime.utcnow()
+    start   = datetime.fromisoformat(ev_data["start"]["dateTime"].replace("Z", ""))
+    end     = datetime.fromisoformat(ev_data["end"]["dateTime"].replace("Z", ""))
+
+    # Step 2: Reject if meeting has already ended
+    if now >= end:
+        raise HTTPException(status_code=403, detail="Meeting has already ended.")
+
+    # Step 3: Enforce 5-minute check-in window (1 min before start → 5 min after)
+    # Blocks anyone calling this remotely outside the physical check-in moment
+    window_open  = start - timedelta(minutes=1)
+    window_close = start + timedelta(minutes=5)
+    if not (window_open <= now <= window_close):
+        raise HTTPException(
+            status_code=403,
+            detail="Check-in only allowed within 5 minutes of meeting start."
+        )
+
+    # Step 4: Reject if already checked in — prevents duplicate patches
+    if "Checked-In" in ev_data.get("categories", []):
+        raise HTTPException(status_code=409, detail="Already checked in.")
+
+    # Step 5: All good — patch the category
     try:
         async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             resp = await client.patch(
                 f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type" : "application/json"
+                },
                 json={"categories": ["Checked-In"]}
             )
     except httpx.TimeoutException:
         _timeout_error()
-    # FIX-09: structured errors instead of 500
+
     if resp.status_code == 404:
         raise HTTPException(status_code=404, detail="Event not found.")
     if resp.status_code not in (200, 201):
         raise HTTPException(status_code=422, detail="Check-in failed.")
+
+    logger.info("Check-in successful: event=%s room=%s", req.event_id[:12], req.room_email)
     return {"status": "checked-in"}
 
 
+# ─── EXTEND MEETING ───────────────────────────────────────────
+# FIX-17: enforces active + checked-in + server-side conflict check
+# Was: no auth, no active check, no checked-in check, conflict only on frontend
 @app.post("/extend-meeting")
 @limiter.limit("30/minute")
 async def extend_meeting(request: Request, req: ExtendRequest):
-    # No auth — physical kiosk presence is the authorization
-    token = await get_app_token()
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
-        ev = await client.get(
-            f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}?$select=end",
-            headers={"Authorization": f"Bearer {token}"}
-        )
-        # FIX-09: structured errors
-        if ev.status_code == 404:
-            raise HTTPException(status_code=404, detail="Event not found.")
-        if ev.status_code != 200:
-            raise HTTPException(status_code=422, detail="Could not retrieve event.")
+    # FIX-15: format validation before Graph URL injection
+    validate_email(req.room_email, "room_email")
+    validate_event_id(req.event_id)
 
-        current_end = datetime.fromisoformat(ev.json()["end"]["dateTime"].replace("Z", ""))
-        new_end_dt  = current_end + timedelta(minutes=req.extend_minutes)
-        resp = await client.patch(
-            f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"end": {"dateTime": new_end_dt.isoformat() + "Z", "timeZone": "UTC"}}
+    token = await get_app_token()
+
+    # Step 1: Fetch event fresh from Graph
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
+            ev = await client.get(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
+                f"?$select=start,end,categories",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
+
+    if ev.status_code == 404:
+        raise HTTPException(status_code=404, detail="Event not found.")
+    if ev.status_code != 200:
+        raise HTTPException(status_code=422, detail="Could not retrieve event.")
+
+    ev_data = ev.json()
+    now     = datetime.utcnow()
+    start   = datetime.fromisoformat(ev_data["start"]["dateTime"].replace("Z", ""))
+    end     = datetime.fromisoformat(ev_data["end"]["dateTime"].replace("Z", ""))
+
+    # Step 2: Meeting must currently be active
+    if now < start:
+        raise HTTPException(status_code=403, detail="Meeting has not started yet.")
+    if now >= end:
+        raise HTTPException(status_code=403, detail="Meeting has already ended.")
+
+    # Step 3: Must be checked in — proves physical presence in the room
+    if "Checked-In" not in ev_data.get("categories", []):
+        raise HTTPException(
+            status_code=403,
+            detail="Meeting must be checked in before it can be extended."
         )
+
+    new_end_dt = end + timedelta(minutes=req.extend_minutes)
+
+    # Step 4: Server-side conflict check — was frontend-only before (bypassable)
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
+            conflict_resp = await client.get(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/calendarView"
+                f"?startDateTime={end.isoformat()}Z&endDateTime={new_end_dt.isoformat()}Z"
+                f"&$select=id,start,end&$top=5",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
+
+    conflicts = [
+        e for e in conflict_resp.json().get("value", [])
+        if e["id"] != req.event_id  # exclude the meeting itself
+    ]
+    if conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot extend — another meeting follows immediately."
+        )
+
+    # Step 5: All good — patch the end time
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
+            resp = await client.patch(
+                f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type" : "application/json"
+                },
+                json={"end": {"dateTime": new_end_dt.isoformat() + "Z", "timeZone": "UTC"}}
+            )
+    except httpx.TimeoutException:
+        _timeout_error()
+
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Failed to extend")
+        raise HTTPException(status_code=resp.status_code, detail="Failed to extend meeting.")
+
+    logger.info("Meeting extended: event=%s room=%s new_end=%s",
+                req.event_id[:12], req.room_email, new_end_dt.isoformat())
     return {"status": "extended", "new_end": new_end_dt.isoformat()}
 
 
-# FIX-02 (v16): token verified + FIX-03: rate limited
+# ─── BOOK ─────────────────────────────────────────────────────
+# FIX-02: token verified + FIX-03: rate limited
+# FIX-18: body now plain text with \r\n so bodyPreview is parseable on kiosk
+#         (HTML <br> was stripped by Graph, breaking subject recovery)
 @app.post("/book")
 @limiter.limit("10/minute")
 async def create_booking(
@@ -411,7 +541,13 @@ async def create_booking(
     req        : BookingRequest,
     user_token : str = Depends(verify_user)
 ):
-    # FIX-02 (v16): verify token is real — get actual identity from Microsoft
+    # FIX-15: validate all emails
+    validate_email(req.room_email,      "room_email")
+    validate_email(req.organizer_email, "organizer_email")
+    for att in req.attendees:
+        validate_email(att.strip(), "attendee email")
+
+    # FIX-02: verify token is real — get actual identity from Microsoft
     actual_email = await verify_token_and_get_email(user_token)
 
     system_token = await get_app_token()
@@ -442,7 +578,13 @@ async def create_booking(
 
     event_payload = {
         "subject" : final_subject,
-        "body"    : {"contentType": "Text", "content": f"Filiale: {req.filiale}\r\nReason: {req.description}"},        "start"   : {"dateTime": req.start_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
+        # FIX-18: plain text with \r\n — Graph strips <br> from bodyPreview,
+        # breaking the kiosk's subject recovery regex. \r\n is preserved.
+        "body"    : {
+            "contentType": "Text",
+            "content"    : f"Filiale: {req.filiale}\r\nReason: {req.description}"
+        },
+        "start"   : {"dateTime": req.start_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
         "end"     : {"dateTime": req.end_time.replace(tzinfo=None).isoformat()   + "Z", "timeZone": "UTC"},
         "location": {"displayName": "Conference Room", "locationEmailAddress": req.room_email},
         "attendees": all_attendees
@@ -457,12 +599,16 @@ async def create_booking(
             )
     except httpx.TimeoutException:
         _timeout_error()
+
     if resp.status_code != 201:
         raise HTTPException(status_code=resp.status_code, detail=f"Booking Failed: {resp.text}")
+
+    logger.info("Booking created by %s for room %s", actual_email, req.room_email)
     return {"status": "success", "data": resp.json()}
 
 
-# FIX-02 (v16): token verified + server-side attendee fetch + FIX-03: rate limited
+# ─── END MEETING ──────────────────────────────────────────────
+# FIX-02: token verified + server-side attendee fetch + FIX-03: rate limited
 @app.post("/end-meeting")
 @limiter.limit("10/minute")
 async def end_meeting(
@@ -470,10 +616,14 @@ async def end_meeting(
     req        : CheckInRequest,
     user_token : str = Depends(verify_user)
 ):
-    # Step 1: verify token is real, get actual identity from Microsoft
+    # FIX-15: format validation
+    validate_email(req.room_email, "room_email")
+    validate_event_id(req.event_id)
+
+    # Step 1: Verify token is real, get actual identity from Microsoft
     actual_email = await verify_token_and_get_email(user_token)
 
-    # Step 2: fetch event fresh from Graph — never trust the client's allowed list
+    # Step 2: Fetch event fresh from Graph — never trust the client's allowed list
     app_token = await get_app_token()
     try:
         async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
@@ -484,7 +634,7 @@ async def end_meeting(
             )
     except httpx.TimeoutException:
         _timeout_error()
-    # FIX-09: structured errors
+
     if ev.status_code == 404:
         raise HTTPException(status_code=404, detail="Event not found.")
     if ev.status_code != 200:
@@ -498,14 +648,16 @@ async def end_meeting(
     ]
     allowed = attendees + [organizer]
 
-    # Step 3: check Microsoft-verified identity against server-fetched list
+    # Step 3: Check Microsoft-verified identity against server-fetched list
     if actual_email not in allowed:
+        logger.warning("Unauthorized end-meeting attempt by %s for event %s",
+                       actual_email, req.event_id[:12])
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not authorized to end this meeting."
         )
 
-    # Step 4: end the meeting
+    # Step 4: End the meeting
     now = datetime.utcnow().isoformat() + "Z"
     try:
         async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
@@ -516,6 +668,9 @@ async def end_meeting(
             )
     except httpx.TimeoutException:
         _timeout_error()
+
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to end meeting")
+
+    logger.info("Meeting ended by %s: event=%s room=%s", actual_email, req.event_id[:12], req.room_email)
     return {"status": "ended"}
