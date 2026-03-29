@@ -442,8 +442,7 @@ async def create_booking(
 
     event_payload = {
         "subject" : final_subject,
-        "body"    : {"contentType": "HTML", "content": f"Filiale: {req.filiale}<br>Reason: {req.description}"},
-        "start"   : {"dateTime": req.start_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
+        "body"    : {"contentType": "Text", "content": f"Filiale: {req.filiale}\r\nReason: {req.description}"},        "start"   : {"dateTime": req.start_time.replace(tzinfo=None).isoformat() + "Z", "timeZone": "UTC"},
         "end"     : {"dateTime": req.end_time.replace(tzinfo=None).isoformat()   + "Z", "timeZone": "UTC"},
         "location": {"displayName": "Conference Room", "locationEmailAddress": req.room_email},
         "attendees": all_attendees
