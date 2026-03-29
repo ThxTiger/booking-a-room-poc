@@ -1,5 +1,5 @@
 # ==========================================
-# Microsoft 365 Room Booking Backend v19
+# Microsoft 365 Room Booking Backend v20
 # Security fixes applied:
 #   FIX-01 (v16): CORS locked
 #   FIX-02 (v16): Token verified via Graph /me
@@ -13,6 +13,8 @@
 #   FIX-10 (v18): Rate limit added to /rooms, /checkin, /extend-meeting
 #   FIX-11 (v18): Query param length validation on GET /active-meeting
 #   FIX-12 (v19): Added CSP, COEP, COOP, CORP headers to middleware
+#   FIX-13 (v20): /active-meeting returns up to 5 upcoming events (was $top=1)
+#                 so multiple booked meetings all appear in the kiosk UI
 # ==========================================
 import os
 import logging
@@ -47,7 +49,7 @@ _is_prod = os.getenv("ENV") == "production"
 
 app = FastAPI(
     title="Vinci Energies Room Booking API",
-    version="17.0.0",
+    version="20.0.0",
     docs_url    = None if _is_prod else "/docs",
     redoc_url   = None if _is_prod else "/redoc",
     openapi_url = None if _is_prod else "/openapi.json",
@@ -150,7 +152,7 @@ async def get_app_token():
         "grant_type"   : "client_credentials",
     }
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             response = await client.post(token_url, data=data)
     except httpx.TimeoutException:
         _timeout_error()
@@ -160,7 +162,7 @@ async def get_app_token():
 # FIX-02 (v16): verify token against Graph /me — rejects fake tokens
 async def verify_token_and_get_email(user_token: str) -> str:
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             me_resp = await client.get(
                 f"{GRAPH_BASE_URL}/me?$select=userPrincipalName",
                 headers={"Authorization": f"Bearer {user_token}"}
@@ -193,7 +195,7 @@ async def remove_ghost_meetings():
                     f"?startDateTime={twenty_mins_ago}&endDateTime={five_mins_ago}"
                     f"&$select=id,subject,categories"
                 )
-                async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+                async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
                     resp = await client.get(url, headers=headers)
                     if resp.status_code == 200:
                         for event in resp.json().get("value", []):
@@ -220,7 +222,7 @@ async def startup_event():
 
 @app.get("/rooms")
 @limiter.limit("60/minute")
-async def get_rooms(request: Request):
+async def get_rooms(request: Request = None):
     return {"value": [
         {
             "displayName" : "Conference Room A",
@@ -241,7 +243,6 @@ async def get_rooms(request: Request):
     ]}
 
 
-# FIX-03: 30 req/min — each request triggers an outbound Graph call
 @app.post("/availability")
 @limiter.limit("30/minute")
 async def check_availability(request: Request, req: AvailabilityRequest):
@@ -258,7 +259,7 @@ async def check_availability(request: Request, req: AvailabilityRequest):
         "availabilityViewInterval": 15
     }
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             resp = await client.post(
                 f"{GRAPH_BASE_URL}/users/{req.room_email}/calendar/getSchedule",
                 headers=headers, json=payload
@@ -268,44 +269,88 @@ async def check_availability(request: Request, req: AvailabilityRequest):
     return resp.json()
 
 
-# FIX-03: 60 req/min — polled every 5 s by kiosks, but one per kiosk
+# ─── ACTIVE MEETING ───────────────────────────────────────────
+# FIX-13 (v20): Now returns a LIST of up to 5 upcoming events
+# (was $top=1 which caused only the first booked meeting to appear).
+#
+# Response shape:
+#   - If a meeting is currently active (now >= start && now < end):
+#       returns that single event object (dict) — unchanged behaviour,
+#       the frontend handles this as before for check-in / red screen.
+#   - If no active meeting but upcoming meetings exist:
+#       returns a LIST of up to 5 future events so the kiosk can show
+#       all of them (primary countdown card + secondary cards below it).
+#   - If nothing found at all:
+#       returns null (None).
+#
+# The frontend must handle both dict and list responses:
+#   const raw   = await res.json();
+#   const events = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+#   const event  = events[0] ?? null;
+# ─────────────────────────────────────────────────────────────
 @app.get("/active-meeting")
 @limiter.limit("60/minute")
 async def get_active_meeting(request: Request, room_email: str):
-    # FIX-04: validate query param length (Pydantic Field only applies to body models)
+    # FIX-11: validate query param length
     if not room_email or len(room_email) > 200:
         raise HTTPException(status_code=422, detail="Invalid room_email.")
-    token       = await get_app_token()
-    now         = datetime.utcnow()
-    found_event = None
 
-    start_win  = now.isoformat() + "Z"
-    end_win    = (now + timedelta(hours=12)).isoformat() + "Z"
+    token = await get_app_token()
+    now   = datetime.utcnow()
+
+    # ── 1. Check for a currently active meeting (started in the past, not yet ended) ──
+    past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
+    now_str    = now.isoformat() + "Z"
+
+    url_active = (
+        f"{GRAPH_BASE_URL}/users/{room_email}/calendarView"
+        f"?startDateTime={past_start}&endDateTime={now_str}"
+        f"&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees"
+        f"&$orderby=start/dateTime desc&$top=1"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
+            resp = await client.get(url_active, headers={"Authorization": f"Bearer {token}"})
+    except httpx.TimeoutException:
+        _timeout_error()
+
+    if resp.status_code == 200:
+        active_events = resp.json().get("value", [])
+        if active_events:
+            event      = active_events[0]
+            event_end  = datetime.fromisoformat(
+                event["end"]["dateTime"].replace("Z", "")
+            )
+            # Only return as "active" if the meeting hasn't ended yet
+            if event_end > now:
+                # Single dict — frontend treats this as the currently running meeting
+                return event
+
+    # ── 2. No active meeting — fetch up to 5 UPCOMING events ──
+    # FIX-13: was $top=1, now $top=5 so all booked meetings are returned
+    future_end = (now + timedelta(hours=12)).isoformat() + "Z"
+
     url_future = (
         f"{GRAPH_BASE_URL}/users/{room_email}/calendarView"
-        f"?startDateTime={start_win}&endDateTime={end_win}"
+        f"?startDateTime={now_str}&endDateTime={future_end}"
         f"&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees"
-        f"&$orderby=start/dateTime&$top=1"
+        f"&$orderby=start/dateTime"
+        f"&$top=5"   # ← was $top=1 — now returns all upcoming meetings
     )
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-        resp = await client.get(url_future, headers={"Authorization": f"Bearer {token}"})
-        if resp.status_code == 200 and resp.json().get("value"):
-            found_event = resp.json()["value"][0]
+    try:
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
+            resp = await client.get(url_future, headers={"Authorization": f"Bearer {token}"})
+    except httpx.TimeoutException:
+        _timeout_error()
 
-    if not found_event:
-        past_start = (now - timedelta(minutes=60)).isoformat() + "Z"
-        url_past   = (
-            f"{GRAPH_BASE_URL}/users/{room_email}/calendarView"
-            f"?startDateTime={past_start}&endDateTime={start_win}"
-            f"&$select=id,subject,bodyPreview,categories,start,end,organizer,attendees"
-            f"&$orderby=start/dateTime desc&$top=1"
-        )
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
-            resp = await client.get(url_past, headers={"Authorization": f"Bearer {token}"})
-            if resp.status_code == 200 and resp.json().get("value"):
-                found_event = resp.json()["value"][0]
+    if resp.status_code == 200:
+        upcoming = resp.json().get("value", [])
+        if upcoming:
+            # Return the full list so the frontend can render all upcoming cards
+            return upcoming   # LIST — frontend checks Array.isArray()
 
-    return found_event
+    # ── 3. Nothing found ──
+    return None
 
 
 @app.post("/checkin")
@@ -314,7 +359,7 @@ async def check_in_meeting(request: Request, req: CheckInRequest):
     # No auth — physical kiosk presence is the authorization
     token = await get_app_token()
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             resp = await client.patch(
                 f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -335,7 +380,7 @@ async def check_in_meeting(request: Request, req: CheckInRequest):
 async def extend_meeting(request: Request, req: ExtendRequest):
     # No auth — physical kiosk presence is the authorization
     token = await get_app_token()
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
         ev = await client.get(
             f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}?$select=end",
             headers={"Authorization": f"Bearer {token}"}
@@ -379,7 +424,7 @@ async def create_booking(
         f"?startDateTime={start_str}&endDateTime={end_str}&$select=subject"
     )
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             check_resp = await client.get(check_url, headers={"Authorization": f"Bearer {system_token}"})
     except httpx.TimeoutException:
         _timeout_error()
@@ -405,7 +450,7 @@ async def create_booking(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             resp = await client.post(
                 f"{GRAPH_BASE_URL}/me/events",
                 headers={"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"},
@@ -432,7 +477,7 @@ async def end_meeting(
     # Step 2: fetch event fresh from Graph — never trust the client's allowed list
     app_token = await get_app_token()
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             ev = await client.get(
                 f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}"
                 f"?$select=organizer,attendees",
@@ -464,7 +509,7 @@ async def end_meeting(
     # Step 4: end the meeting
     now = datetime.utcnow().isoformat() + "Z"
     try:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:  # FIX-05
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
             resp = await client.patch(
                 f"{GRAPH_BASE_URL}/users/{req.room_email}/events/{req.event_id}",
                 headers={"Authorization": f"Bearer {app_token}", "Content-Type": "application/json"},
