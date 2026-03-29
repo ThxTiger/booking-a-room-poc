@@ -224,15 +224,19 @@ async def get_rooms(request: Request):
     return {"value": [
         {
             "displayName" : "Conference Room A",
-            "emailAddress": "ConferenceRoomA@AxiansPoc611.onmicrosoft.com",
-            "floor"       : "Floor 3", "department": "Axians",
-            "capacity"    : 8, "location": "Casablanca HQ"
+            "emailAddress": "ConferenceRoomA@VINCIEnergies1.onmicrosoft.com",
+            "floor"       : "Floor 3",
+            "department"  : "Axians",
+            "capacity"    : 8,
+            "location"    : "Casablanca HQ"
         },
         {
             "displayName" : "Conference Room C",
-            "emailAddress": "ConferenceRoomC@AxiansPoc611.onmicrosoft.com",
-            "floor"       : "Floor 4", "department": "QHSE",
-            "capacity"    : 8, "location": "Casablanca HQ"
+            "emailAddress": "ConferenceRoomC@VINCIEnergies1.onmicrosoft.com",
+            "floor"       : "Floor 3",
+            "department"  : "Axians",
+            "capacity"    : 8,
+            "location"    : "Casablanca HQ"
         }
     ]}
 
